@@ -74,6 +74,8 @@ rules:
 
 - [docs/spec/technical-design.md](./docs/spec/technical-design.md) — full
   technical design (API, architecture, lifecycle, failure handling, testing)
+- [docs/spec/e2e-integration-test-plan.md](./docs/spec/e2e-integration-test-plan.md) —
+  real-cluster integration test plan (kind + Docker)
 
 ## Requirements
 
