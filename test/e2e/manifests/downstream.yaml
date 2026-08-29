@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: downstream
+  namespace: gokubegate-e2e
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: downstream
+  template:
+    metadata:
+      labels:
+        app: downstream
+    spec:
+      containers:
+        - name: downstream
+          image: gokubegate-e2e/downstream:test
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 1
+            periodSeconds: 1
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: downstream
+  namespace: gokubegate-e2e
+spec:
+  selector:
+    app: downstream
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+      targetPort: 8080

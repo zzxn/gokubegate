@@ -1,0 +1,5 @@
+# e2e image builds copy the repo root as build context.
+.git
+.cache
+docs
+*.md

@@ -20,3 +20,8 @@ go.work.sum
 # Local kube config used in out-of-cluster tests
 .kube/
 kubeconfig
+
+# e2e artifacts
+.cache/
+/test/e2e/downstream/downstream
+/test/e2e/tester/tester

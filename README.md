@@ -76,6 +76,7 @@ rules:
   technical design (API, architecture, lifecycle, failure handling, testing)
 - [docs/spec/e2e-integration-test-plan.md](./docs/spec/e2e-integration-test-plan.md) —
   real-cluster integration test plan (kind + Docker)
+- [test/e2e/README.md](./test/e2e/README.md) — running the real-cluster suite
 
 ## Requirements
 
