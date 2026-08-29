@@ -28,7 +28,7 @@ Kubernetes Service 的 ClusterIP 负载均衡是 L4 级别的：**只在 TCP 建
 4. 默认零配置开箱即用；必要的定制全部通过可选参数（functional options）提供。
 5. 优雅生命周期：启动时等待 informer cache sync，关闭时优雅 drain 在途请求。
 6. Kubernetes API Server 短暂不可用时，继续用 last-known-good 快照转发，不中断业务。
-7. 可观测：极简指标接口 + 可选 Prometheus 适配包 + 标准库 `slog` 日志。
+7. 可观测：事件 Hook 机制，由使用方自行实现指标/追踪/审计；默认零采集、零日志依赖。
 8. 一个 `Client` 对应一个下游 Service；多服务场景由用户组合多个 `Client`，不搞隐式聚合。
 
 ## 3. 非目标（v0.1 不包含）
@@ -249,7 +249,7 @@ type PodBackend struct {
 4. 克隆请求（浅拷贝 + 克隆 URL），按 8.1 规则改写 URL/Host；
 5. `backend.transport.RoundTrip(req)`；
 6. 成功：包装 `resp.Body`，在首次 `Close` 时 `inflight.Add(-1)`（幂等）；失败且无 response：立即 `inflight.Add(-1)`；
-7. 记录指标（pick、request result、inflight、connections reused）。
+7. 发出事件（`endpoint_picked`、`request_done`）。
 
 并发安全：Gate 可被多个 goroutine / 多个 http.Client 并发使用。
 
@@ -372,39 +372,75 @@ informer 完成首次同步后 list/watch 断开：
 
 ## 11. 可观测性
 
-### 11.1 Observer 接口（核心库零依赖）
+### 11.1 设计原则：Hook 事件，默认零采集
+
+核心库**不内置指标实现，也不依赖任何 metrics 库**。可观测能力通过事件 Hook 暴露，由使用方自行实现指标、追踪或审计，类似 `slog.Logger`：默认无输出，按需注入。
 
 ```go
-type Observer interface {
-    SetEndpoints(service string, ready, draining int)
-    SetLastSync(service string, unixSeconds float64)
-    IncPicks(service, endpoint string)
-    IncRequests(service, endpoint, result string)
-    SetInflight(service, endpoint string, n int64)
-    IncReconcile(service, result string)
-    IncDrain(service, result string)
-    IncConnections(service, endpoint, reused string)
+// Hook 接收 gokubegate 运行时事件；实现必须快速返回，不得阻塞请求路径。
+type Hook interface {
+    Handle(Event)
+}
+
+type Event struct {
+    Kind     EventKind
+    Service  string        // 目标服务
+    Endpoint string        // 短标签（Pod 名或地址 hash）
+    Ready    int           // endpoints_updated：Ready 数量
+    Draining int           // endpoints_updated：draining 数量
+    Result   string        // 结果：success/error/completed/timeout
+    Reused   bool          // request_done：连接是否复用
+    Err      error         // reconcile 失败原因
+    Duration time.Duration // request_done：往返耗时
 }
 ```
 
-- 默认 `NoopObserver`；`WithMetrics(obs Observer)` 注入。
-- 提供 `gokubegate/prometheus` 适配包，把 Observer 映射到 Prometheus 指标，避免核心库硬依赖 `prometheus/client_golang`。
+事件类型：
 
-### 11.2 建议指标（prometheus 适配包）
+| EventKind | 触发时机 | 主要字段 |
+| --- | --- | --- |
+| `endpoints_updated` | 快照 reconcile 后 | Ready, Draining |
+| `endpoint_picked` | 每次请求选择 endpoint 后 | Endpoint |
+| `request_done` | 请求完成（响应或错误） | Endpoint, Result, Reused, Duration |
+| `reconcile` | 每次 reconcile 尝试 | Result, Err |
+| `endpoint_drained` | 摘除的 endpoint drain 完成/超时 | Endpoint, Result |
 
-| 指标 | 类型 | 标签 | 说明 |
-| --- | --- | --- | --- |
-| `gokubegate_endpoints` | Gauge | service, state | ready/draining 数量 |
-| `gokubegate_last_sync_timestamp_seconds` | Gauge | service | 最近成功同步时间 |
-| `gokubegate_picks_total` | Counter | service, endpoint | Picker 分布 |
-| `gokubegate_requests_total` | Counter | service, endpoint, result | 实际请求结果 |
-| `gokubegate_inflight` | Gauge | service, endpoint | 在途请求/stream |
-| `gokubegate_reconcile_total` | Counter | service, result | reconcile 结果 |
-| `gokubegate_drain_total` | Counter | service, result | drain 完成或超时 |
-| `gokubegate_connections_total` | Counter | service, endpoint, reused | 建连与复用 |
+注册方式：
 
-- `endpoint` 标签用短 Pod 名或稳定短 hash，基数上限 ≈ 滚动窗口内 Pod 数，需验证时序增长；
-- 正常 pick 不写日志，只记指标；日志用标准库 `slog`（`WithLogger` 注入，默认丢弃）。
+```go
+client, err := gokubegate.NewClient(ctx, "demo", "demo-chat",
+    gokubegate.WithHook(prometheusHook),      // 可注册多个
+    gokubegate.WithHook(auditHook),
+)
+```
+
+默认无任何 Hook（零开销）；`WithHooks(...)` 可一次注册多个。Hook 按注册顺序同步调用，实现方不要把耗时操作放进 `Handle`。
+
+### 11.2 日志
+
+- 默认**不输出任何日志**（discard handler）；
+- `WithLogger(*slog.Logger)` 注入自己的 logger；
+- `WithDebug()` 开启内部 debug 日志（写 stderr）。
+
+### 11.3 使用方实现示例（Prometheus）
+
+库本身不提供 Prometheus 适配；下面是一段基于 Hook 的最小实现思路（M2 会在 `examples/` 提供完整示例）：
+
+```go
+type promHook struct{ requests *prometheus.CounterVec }
+
+func (h *promHook) Handle(e gokubegate.Event) {
+    switch e.Kind {
+    case gokubegate.EventRequestDone:
+        h.requests.WithLabelValues(e.Service, e.Endpoint, e.Result).Inc()
+    case gokubegate.EventEndpointsUpdated:
+        h.endpoints.WithLabelValues(e.Service, "ready").Set(float64(e.Ready))
+    }
+}
+```
+
+- `endpoint` 标签用短 Pod 名或稳定短 hash，基数上限 ≈ 滚动窗口内 Pod 数；
+- 正常请求不写日志，只发事件；事件不含用户数据与 bearer token。
 
 ## 12. 安全与网络约束
 
@@ -444,16 +480,15 @@ gokubegate/
   picker.go       // Strategy 接口 + RoundRobin/Random
   backend.go      // PodBackend、transport、drain
   options.go      // 全部 functional options 与默认值
-  metrics.go      // Observer 接口 + NoopObserver
+  hooks.go        // Hook 接口 + Event 类型
   errors.go       // ErrNoEndpoints 等类型化错误
-  prometheus/     // Prometheus 适配包（M2）
   *_test.go
 ```
 
 ## 15. 里程碑
 
 - **M1（核心可用）**：上述包 + 单测；`NewClient`/`NewGate` 可用；默认配置通过；RBAC 文档。
-- **M2（可观测 + 集成）**：`prometheus` 适配包；envtest/kind 集成测试；扩缩容用例。
+- **M2（示例与集成）**：基于 Hook 的 Prometheus 示例（`examples/`）；envtest/kind 集成测试；扩缩容用例。
 - **M3（发布）**：压测定容量；README 与示例完善；打 tag 发布 v0.1。
 
 ## 16. 待实施前确认项

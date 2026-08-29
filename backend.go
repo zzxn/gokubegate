@@ -1,0 +1,141 @@
+package gokubegate
+
+import (
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/hex"
+	"io"
+	"net"
+	"net/http"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// PodBackend owns the isolated connection pool for one pod endpoint.
+// It is created by the reconciler and never shared across endpoints.
+type PodBackend struct {
+	key      EndpointKey
+	address  string // host:port dialed
+	podName  string
+	nodeName string
+	label    string // short stable label for events/metrics
+
+	transport *http.Transport
+	inflight  atomic.Int64
+	draining  atomic.Bool
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newPodBackend(key EndpointKey, address, podName, nodeName, logicalHost string, cfg *Config) *PodBackend {
+	var tlsConfig *tls.Config
+	if cfg.Scheme == "https" {
+		// TLS ServerName must be the logical service hostname, not the pod IP,
+		// so certificates must cover the service hostname.
+		tlsConfig = &tls.Config{ServerName: logicalHost, MinVersion: tls.VersionTLS12}
+	}
+
+	tr := &http.Transport{
+		MaxIdleConns:          cfg.MaxIdleConnsPerPod,
+		MaxIdleConnsPerHost:   cfg.MaxIdleConnsPerPod,
+		MaxConnsPerHost:       0,
+		IdleConnTimeout:       cfg.IdleConnTimeout,
+		TLSHandshakeTimeout:   cfg.DialTimeout,
+		ExpectContinueTimeout: time.Second,
+		TLSClientConfig:       tlsConfig,
+		DialContext: (&net.Dialer{
+			Timeout:   cfg.DialTimeout,
+			KeepAlive: cfg.TCPKeepAlive,
+		}).DialContext,
+		// HTTP/2 is intentionally disabled in v0.1: multiplexed long-lived
+		// connections would defeat request-level balancing. The per-pod
+		// transport boundary keeps the option open for the future.
+		ForceAttemptHTTP2:     false,
+		DisableCompression:    false,
+		ResponseHeaderTimeout: cfg.ResponseHeaderTimeout,
+		DisableKeepAlives:     false,
+	}
+
+	return &PodBackend{
+		key:       key,
+		address:   address,
+		podName:   podName,
+		nodeName:  nodeName,
+		label:     endpointLabel(podName, address),
+		transport: tr,
+		closed:    make(chan struct{}),
+	}
+}
+
+// roundTrip performs the downstream request, tracking in-flight count.
+// The returned body decrements the counter exactly once when closed.
+func (b *PodBackend) roundTrip(req *http.Request) (*http.Response, error) {
+	b.inflight.Add(1)
+	resp, err := b.transport.RoundTrip(req)
+	if err != nil {
+		b.inflight.Add(-1)
+		return nil, err
+	}
+	resp.Body = &inflightBody{ReadCloser: resp.Body, onClose: func() { b.inflight.Add(-1) }}
+	return resp, nil
+}
+
+// closeIdle closes idle keep-alive connections of this backend.
+func (b *PodBackend) closeIdle() { b.transport.CloseIdleConnections() }
+
+// startDrain removes the backend from rotation and waits for in-flight
+// requests to finish (or DrainTimeout). In-flight requests are never
+// interrupted. onDone is called when the drain finishes.
+func (b *PodBackend) startDrain(cfg *Config, onDone func()) {
+	go func() {
+		b.draining.Store(true)
+		b.closeIdle()
+
+		deadline := time.Now().Add(cfg.DrainTimeout)
+		for b.inflight.Load() > 0 {
+			if time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		// Close again to drop connections that became idle during draining.
+		b.closeIdle()
+
+		timedOut := b.inflight.Load() > 0
+		b.closeOnce.Do(func() { close(b.closed) })
+
+		result := "completed"
+		if timedOut {
+			result = "timeout"
+		}
+		emit(cfg, Event{Kind: EventEndpointDrained, Endpoint: b.label, Result: result})
+		if onDone != nil {
+			onDone()
+		}
+	}()
+}
+
+// inflightBody wraps a response body and invokes onClose exactly once.
+type inflightBody struct {
+	io.ReadCloser
+	once    sync.Once
+	onClose func()
+}
+
+// Close implements io.Closer.
+func (b *inflightBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(b.onClose)
+	return err
+}
+
+// endpointLabel returns a short stable label for events and metrics:
+// the pod name when available, otherwise a hash of the dial address.
+func endpointLabel(podName, address string) string {
+	if podName != "" {
+		return podName
+	}
+	sum := sha256.Sum256([]byte(address))
+	return hex.EncodeToString(sum[:6])
+}
