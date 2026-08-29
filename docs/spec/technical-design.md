@@ -462,6 +462,10 @@ func (h *promHook) Handle(e gokubegate.Event) {
 ### 13.2 集成测试（envtest / kind）
 
 - 多副本测试服务返回自身 identity，验证：短请求下各 endpoint pick 数差值 ≤ 1；连接复用；扩容后新 Pod 开始接流量；缩容/NotReady 后停止接流量且在途完成；API Server 抖动时 last-known-good。
+- 持续并发：单个长生命周期 Client 在 64 并发下每 2 秒执行一次 `2→8→2→6→1→4`，按秒记录请求数、错误率和 p95，禁止完整秒级全断；
+- SSE：20 条并发长流逐事件校验 Pod identity，一条流内不得切换 Pod，新流在 Ready Pod 间均衡；
+- 控制面故障：持续流量期间暂停 kind control-plane 5 秒，验证 last-known-good 快照零错误转发；
+- 并发梯度：1/8/32/64 worker 分别记录吞吐、连接复用率和 p50/p95/p99/max。
 
 ### 13.3 性能与稳定性
 
@@ -499,7 +503,32 @@ gokubegate/
 4. 是否需要在库内提供 Service DNS 回退模式开关（默认不开，文档说明风险）；
 5. 开源协议选择（建议 Apache-2.0）。
 
-## 17. 参考资料
+## 17. TODO：Service 连接轮换模式
+
+除当前直接发现并选择 Pod 的 `pod` 模式外，后续需要实现一个并列的 **Service 连接轮换模式**
+（最终公开名称待定，可暂称 `service-rotate`）。该模式复用单个 `http.Transport` / 连接池，仍然
+访问 Kubernetes Service DNS/ClusterIP，不直接拨 Pod IP；通过低比例随机设置
+`http.Request.Close = true`，让承载本次普通 HTTP 请求的连接在响应完成后退出连接池，促使后续
+新连接由 Kubernetes L4 Service 重新选择 endpoint。
+
+该 TODO 复刻 demo 已验证的连接轮换语义，并与 `pod` 模式保持清晰边界：
+
+- `pod`：EndpointSlice + 请求级 Picker + 每 Pod 独立 Transport，提供确定性的 Ready Pod 分发；
+- `service-rotate`：单一共享 Transport + Service 地址 + 概率性连接轮换，只改善长连接粘连，
+  不承诺请求级精确均衡；
+- 配置使用采样分母表达，例如 `0` 表示关闭，`100` 表示约 1% 请求设置 `req.Close`；生产配置
+  必须限制最低分母（demo 当前为 100），避免过高轮换率造成连接风暴；
+- 只对普通、可在有限时间内完成响应的 HTTP 请求采样；SSE/流式请求默认不参与随机关闭；
+- 必须保留用户显式 `req.Close`，并保证不修改调用方原始 Request（clone 后再设置）；
+- 提供轮换次数、连接复用率等 Hook 事件，并让 `Client.Mode()` 返回实际模式；
+- API 设计需明确模式枚举和选项（如 `WithMode(...)`、`WithConnectionCloseSampleDenominator(...)`），
+  默认仍为当前 `pod` 模式，避免已有行为变化。
+
+实施验收至少包含：采样边界单测、并发/race、SSE 不轮换、共享 Transport 复用，以及在真实
+Kubernetes Service 下对比 `pod`、纯 L4 keep-alive、`service-rotate` 三种模式的分布、吞吐、
+p99、新建连接率和扩容收敛速度。
+
+## 18. 参考资料
 
 - [Kubernetes EndpointSlice API](https://kubernetes.io/docs/reference/kubernetes-api/discovery/endpoint-slice-v1/)
 - [client-go SharedInformerFactory](https://github.com/kubernetes/client-go/blob/master/informers/factory.go)

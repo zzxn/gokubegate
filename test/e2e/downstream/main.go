@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 var (
@@ -68,6 +69,7 @@ func main() {
 	http.HandleFunc("/ready", handleReady)
 	http.HandleFunc("/stats", handleStats)
 	http.HandleFunc("/admin/ready", handleAdminReady)
+	http.HandleFunc("/stream", handleStream)
 
 	addr := ":8080"
 	if a := os.Getenv("DOWNSTREAM_ADDR"); a != "" {
@@ -135,4 +137,58 @@ func handleAdminReady(w http.ResponseWriter, r *http.Request) {
 	}
 	ready.Store(body.Ready)
 	writeJSON(w, map[string]any{"ready": body.Ready})
+}
+
+// handleStream emits pod identity as SSE events for long-connection affinity
+// tests. A stream must remain on this pod for its entire lifetime.
+func handleStream(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	duration := 2 * time.Second
+	if value := r.URL.Query().Get("duration"); value != "" {
+		parsed, err := time.ParseDuration(value)
+		if err != nil || parsed <= 0 || parsed > 30*time.Second {
+			http.Error(w, "invalid duration", http.StatusBadRequest)
+			return
+		}
+		duration = parsed
+	}
+	interval := 50 * time.Millisecond
+	if value := r.URL.Query().Get("interval"); value != "" {
+		parsed, err := time.ParseDuration(value)
+		if err != nil || parsed <= 0 || parsed > time.Second {
+			http.Error(w, "invalid interval", http.StatusBadRequest)
+			return
+		}
+		interval = parsed
+	}
+
+	hits.Add(1)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	emit := func() {
+		payload, _ := json.Marshal(map[string]string{"pod": podName()})
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", payload)
+		flusher.Flush()
+	}
+	emit()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-timer.C:
+			return
+		case <-ticker.C:
+			emit()
+		}
+	}
 }

@@ -127,6 +127,70 @@ func requireEndpointSet(t *testing.T, got map[string]int, want []string) {
 	}
 }
 
+func runCustomTester(t *testing.T, ctx context.Context, jobName string, args []string) TesterResult {
+	t.Helper()
+	logs, err := h.RunTesterJob(ctx, jobName, args)
+	if err != nil {
+		t.Fatalf("tester job %s: %v", jobName, err)
+	}
+	res, err := ParseTesterResult(logs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res
+}
+
+// TestE2EAPIServerPause (S7) verifies that request routing continues from the
+// last-known-good snapshot while the kind control plane is unavailable.
+func TestE2EAPIServerPause(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	ensureDownstream(t, ctx, 2)
+
+	const jobName = "tester-apiserver-pause"
+	args := []string{
+		"-phase", "apiserver-pause",
+		"-namespace", h.opts.Namespace,
+		"-service", h.opts.Service,
+		"-url", svcURL("/"),
+		"-concurrency", "32",
+		"-duration", "15s",
+	}
+	if err := h.StartTesterJob(ctx, jobName, args); err != nil {
+		t.Fatalf("start sustained tester: %v", err)
+	}
+	time.Sleep(3 * time.Second)
+	if err := h.PauseControlPlane(ctx); err != nil {
+		t.Fatal(err)
+	}
+	pausedAt := time.Now()
+	defer func() { _ = h.ResumeControlPlane(ctx) }()
+	time.Sleep(5 * time.Second)
+	if err := h.ResumeControlPlane(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("API server unavailable for %s under sustained load", time.Since(pausedAt).Round(time.Millisecond))
+
+	logs, err := h.WaitTesterJob(ctx, jobName)
+	if err != nil {
+		t.Fatalf("wait tester after API server recovery: %v", err)
+	}
+	res, err := ParseTesterResult(logs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Errors != 0 || res.Success < 1_000 {
+		t.Fatalf("last-known-good routing failed: requests=%d success=%d errors=%d kinds=%v", res.Requests, res.Success, res.Errors, res.ErrorKinds)
+	}
+	for i, window := range res.Windows {
+		if i > 0 && i < len(res.Windows)-1 && window.Success == 0 {
+			t.Fatalf("API pause caused a full-second outage: %+v", window)
+		}
+	}
+	t.Logf("API pause summary: requests=%d errors=%d throughput=%.1f/s latency_ms[p50=%.2f p95=%.2f p99=%.2f max=%.2f]",
+		res.Requests, res.Errors, res.Throughput, res.LatencyP50Ms, res.LatencyP95Ms, res.LatencyP99Ms, res.LatencyMaxMs)
+}
+
 // TestE2EBasicDistribution (S1): 500 requests across 2 pods must be split
 // within tolerance, with connection reuse, and cross-checked by pod-side stats.
 func TestE2EBasicDistribution(t *testing.T) {
@@ -168,6 +232,158 @@ func TestE2EBasicDistribution(t *testing.T) {
 		}
 		t.Logf("baseline pod-side count: pod=%s requests=%d", pod, delta)
 	}
+}
+
+// TestE2EConcurrentRapidScaling keeps one client under 64-way sustained load
+// while the Deployment is resized every two seconds. Per-second windows catch
+// short blackouts that aggregate success rates could hide.
+func TestE2EConcurrentRapidScaling(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
+	defer cancel()
+	ensureDownstream(t, ctx, 2)
+	defer ensureDownstream(t, ctx, 2)
+
+	const (
+		jobName     = "tester-rapid-scaling"
+		concurrency = 64
+		loadTime    = 24 * time.Second
+	)
+	args := []string{
+		"-phase", "rapid-scaling",
+		"-namespace", h.opts.Namespace,
+		"-service", h.opts.Service,
+		"-url", svcURL("/"),
+		"-concurrency", fmt.Sprintf("%d", concurrency),
+		"-duration", loadTime.String(),
+	}
+	if err := h.StartTesterJob(ctx, jobName, args); err != nil {
+		t.Fatalf("start sustained tester: %v", err)
+	}
+
+	started := time.Now()
+	timeline := []int32{8, 2, 6, 1, 4}
+	for _, replicas := range timeline {
+		time.Sleep(2 * time.Second)
+		if err := h.ScaleDeployment(ctx, "downstream", replicas); err != nil {
+			t.Fatalf("rapid scale to %d: %v", replicas, err)
+		}
+		t.Logf("rapid scaling command: elapsed=%s replicas=%d", time.Since(started).Round(time.Millisecond), replicas)
+	}
+	if err := h.WaitDeploymentReady(ctx, "downstream", 4); err != nil {
+		t.Fatalf("wait for final four replicas: %v", err)
+	}
+	if err := h.WaitEndpointsReady(ctx, 4); err != nil {
+		t.Fatalf("wait for final four endpoints: %v", err)
+	}
+
+	logs, err := h.WaitTesterJob(ctx, jobName)
+	if err != nil {
+		t.Fatalf("wait sustained tester: %v", err)
+	}
+	res, err := ParseTesterResult(logs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Requests < 1_000 {
+		t.Fatalf("sustained test generated only %d requests", res.Requests)
+	}
+	errorRatio := float64(res.Errors) / float64(res.Requests)
+	if errorRatio > 0.01 {
+		t.Fatalf("rapid scaling error ratio %.3f%% exceeds 1%%: errors=%v samples=%v", errorRatio*100, res.ErrorKinds, res.ErrorSamples)
+	}
+	if res.LatencyP99Ms > 2_000 {
+		t.Fatalf("rapid scaling p99 %.1fms exceeds 2s", res.LatencyP99Ms)
+	}
+	if len(res.ByEndpoint) < 4 {
+		t.Fatalf("only %d endpoints received traffic during scaling: %v", len(res.ByEndpoint), res.ByEndpoint)
+	}
+
+	maxWindowErrorRatio := float64(0)
+	for i, window := range res.Windows {
+		// The first and final windows may be partial; all complete windows must
+		// retain successful traffic, even during EndpointSlice transitions.
+		complete := i > 0 && i < len(res.Windows)-1
+		if complete && window.Success == 0 {
+			t.Fatalf("complete second %d had no successful requests: %+v", window.Second, window)
+		}
+		windowErrorRatio := float64(0)
+		if window.Requests > 0 {
+			windowErrorRatio = float64(window.Errors) / float64(window.Requests)
+		}
+		if windowErrorRatio > maxWindowErrorRatio {
+			maxWindowErrorRatio = windowErrorRatio
+		}
+		t.Logf("load window: second=%d requests=%d success=%d errors=%d p95=%.2fms",
+			window.Second, window.Requests, window.Success, window.Errors, window.LatencyP95Ms)
+	}
+	t.Logf("rapid scaling summary: requests=%d success=%d errors=%d errorRatio=%.4f%% throughput=%.1f/s reuse=%.3f latency_ms[p50=%.2f p95=%.2f p99=%.2f max=%.2f] maxWindowErrorRatio=%.4f%% endpoints=%d errorKinds=%v endpointUpdates=%+v",
+		res.Requests, res.Success, res.Errors, errorRatio*100, res.Throughput, res.ReusedRatio,
+		res.LatencyP50Ms, res.LatencyP95Ms, res.LatencyP99Ms, res.LatencyMaxMs,
+		maxWindowErrorRatio*100, len(res.ByEndpoint), res.ErrorKinds, res.EndpointUpdates)
+	if res.Errors > 0 {
+		t.Logf("rapid scaling error samples: %v", res.ErrorSamples)
+	}
+}
+
+// TestE2EConcurrencyGradient records latency and throughput under increasing
+// concurrency on a stable four-pod endpoint set.
+func TestE2EConcurrencyGradient(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	pods := ensureDownstream(t, ctx, 4)
+	defer ensureDownstream(t, ctx, 2)
+
+	for _, concurrency := range []int{1, 8, 32, 64} {
+		name := fmt.Sprintf("concurrency-%d", concurrency)
+		res := runCustomTester(t, ctx, "tester-"+name, []string{
+			"-phase", name,
+			"-namespace", h.opts.Namespace,
+			"-service", h.opts.Service,
+			"-url", svcURL("/"),
+			"-concurrency", fmt.Sprintf("%d", concurrency),
+			"-duration", "4s",
+		})
+		if res.Errors != 0 || res.Success < 100 {
+			t.Fatalf("concurrency %d: requests=%d success=%d errors=%d kinds=%v", concurrency, res.Requests, res.Success, res.Errors, res.ErrorKinds)
+		}
+		requireEndpointSet(t, res.ByEndpoint, pods)
+		if res.LatencyP99Ms > 2_000 {
+			t.Fatalf("concurrency %d p99 %.2fms exceeds 2s", concurrency, res.LatencyP99Ms)
+		}
+		t.Logf("concurrency gradient: concurrency=%d requests=%d throughput=%.1f/s reuse=%.3f latency_ms[p50=%.2f p95=%.2f p99=%.2f max=%.2f]",
+			concurrency, res.Requests, res.Throughput, res.ReusedRatio,
+			res.LatencyP50Ms, res.LatencyP95Ms, res.LatencyP99Ms, res.LatencyMaxMs)
+	}
+}
+
+// TestE2ESSEAffinity (S6) opens concurrent long-lived streams. Each stream's
+// tester-side parser fails if events ever identify more than one pod.
+func TestE2ESSEAffinity(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	pods := ensureDownstream(t, ctx, 4)
+	defer ensureDownstream(t, ctx, 2)
+
+	const streams = 20
+	res := runCustomTester(t, ctx, "tester-sse", []string{
+		"-phase", "sse",
+		"-namespace", h.opts.Namespace,
+		"-service", h.opts.Service,
+		"-url", svcURL("/stream?duration=2s&interval=50ms"),
+		"-mode", "sse",
+		"-requests", fmt.Sprintf("%d", streams),
+		"-concurrency", fmt.Sprintf("%d", streams),
+	})
+	if res.Success != streams || res.Errors != 0 {
+		t.Fatalf("SSE affinity failed: success=%d errors=%d kinds=%v", res.Success, res.Errors, res.ErrorKinds)
+	}
+	requireEndpointSet(t, res.ByEndpoint, pods)
+	for pod, count := range res.ByEndpoint {
+		if count != streams/len(pods) {
+			t.Fatalf("SSE pod %s got %d streams, want %d; distribution=%v", pod, count, streams/len(pods), res.ByEndpoint)
+		}
+	}
+	t.Logf("SSE summary: streams=%d duration=%dms success=%d distribution=%v", streams, res.DurationMs, res.Success, res.ByEndpoint)
 }
 
 // TestE2EHostAndPathPreservation (S2): downstream must see the logical service

@@ -21,27 +21,58 @@ import (
 
 // TesterResult mirrors the JSON emitted by the tester CLI.
 type TesterResult struct {
-	Phase       string         `json:"phase"`
-	Requests    int            `json:"requests"`
-	Success     int            `json:"success"`
-	Errors      int            `json:"errors"`
-	ByEndpoint  map[string]int `json:"byEndpoint"`
-	Reused      int            `json:"reused"`
-	Connections int            `json:"connections"`
-	ReusedRatio float64        `json:"reusedRatio"`
-	HostEcho    string         `json:"hostEcho"`
-	PathEcho    string         `json:"pathEcho"`
-	QueryEcho   string         `json:"queryEcho"`
-	DurationMs  int64          `json:"durationMs"`
+	Phase           string                 `json:"phase"`
+	Requests        int                    `json:"requests"`
+	Success         int                    `json:"success"`
+	Errors          int                    `json:"errors"`
+	Concurrency     int                    `json:"concurrency"`
+	ByEndpoint      map[string]int         `json:"byEndpoint"`
+	ErrorKinds      map[string]int         `json:"errorKinds"`
+	ErrorSamples    map[string]string      `json:"errorSamples"`
+	Reused          int                    `json:"reused"`
+	Connections     int                    `json:"connections"`
+	ReusedRatio     float64                `json:"reusedRatio"`
+	HostEcho        string                 `json:"hostEcho"`
+	PathEcho        string                 `json:"pathEcho"`
+	QueryEcho       string                 `json:"queryEcho"`
+	DurationMs      int64                  `json:"durationMs"`
+	Throughput      float64                `json:"throughput"`
+	LatencyP50Ms    float64                `json:"latencyP50Ms"`
+	LatencyP95Ms    float64                `json:"latencyP95Ms"`
+	LatencyP99Ms    float64                `json:"latencyP99Ms"`
+	LatencyMaxMs    float64                `json:"latencyMaxMs"`
+	Windows         []TesterWindow         `json:"windows"`
+	EndpointUpdates []TesterEndpointUpdate `json:"endpointUpdates"`
+}
+
+type TesterWindow struct {
+	Second       int     `json:"second"`
+	Requests     int     `json:"requests"`
+	Success      int     `json:"success"`
+	Errors       int     `json:"errors"`
+	LatencyP95Ms float64 `json:"latencyP95Ms"`
+}
+
+type TesterEndpointUpdate struct {
+	ElapsedMs int64 `json:"elapsedMs"`
+	Ready     int   `json:"ready"`
+	Draining  int   `json:"draining"`
 }
 
 // ParseTesterResult decodes the tester CLI's single JSON line from its logs.
 func ParseTesterResult(logs string) (TesterResult, error) {
 	var r TesterResult
-	if err := json.Unmarshal([]byte(strings.TrimSpace(logs)), &r); err != nil {
-		return r, fmt.Errorf("parse tester result: %w (logs: %q)", err, logs)
+	lines := strings.Split(strings.TrimSpace(logs), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		if err := json.Unmarshal([]byte(line), &r); err == nil {
+			return r, nil
+		}
 	}
-	return r, nil
+	return r, fmt.Errorf("parse tester result: no JSON result found (logs: %q)", logs)
 }
 
 // Apply runs kubectl apply -f on a manifest (with --server-side=false).
@@ -218,6 +249,26 @@ func (h *Harness) RunTesterJob(ctx context.Context, name string, args []string) 
 	return h.runTesterJob(ctx, name, "gokubegate-tester", args, true)
 }
 
+// StartTesterJob creates a long-running tester Job and waits until NewClient
+// has synced and the load workers are about to start.
+func (h *Harness) StartTesterJob(ctx context.Context, name string, args []string) error {
+	if err := h.createTesterJob(ctx, name, "gokubegate-tester", args); err != nil {
+		return err
+	}
+	return WaitFor(ctx, 200*time.Millisecond, 2*time.Minute, "tester ready marker "+name, func() (bool, error) {
+		logs, err := h.JobLogs(ctx, name)
+		if err != nil {
+			return false, err
+		}
+		return strings.Contains(logs, "GOKUBEGATE_TESTER_READY"), nil
+	})
+}
+
+// WaitTesterJob waits for a previously started tester Job and returns logs.
+func (h *Harness) WaitTesterJob(ctx context.Context, name string) (string, error) {
+	return h.waitTesterJob(ctx, name, true)
+}
+
 // RunTesterJobExpectFailure runs a tester under the given ServiceAccount and
 // returns its logs once the Job reaches the failed state.
 func (h *Harness) RunTesterJobExpectFailure(ctx context.Context, name, serviceAccount string, args []string) (string, error) {
@@ -225,9 +276,16 @@ func (h *Harness) RunTesterJobExpectFailure(ctx context.Context, name, serviceAc
 }
 
 func (h *Harness) runTesterJob(ctx context.Context, name, serviceAccount string, args []string, wantSuccess bool) (string, error) {
+	if err := h.createTesterJob(ctx, name, serviceAccount, args); err != nil {
+		return "", err
+	}
+	return h.waitTesterJob(ctx, name, wantSuccess)
+}
+
+func (h *Harness) createTesterJob(ctx context.Context, name, serviceAccount string, args []string) error {
 	ns := h.opts.Namespace
 	if err := h.deleteJob(ctx, name); err != nil {
-		return "", err
+		return err
 	}
 
 	job := &batchv1.Job{
@@ -248,9 +306,13 @@ func (h *Harness) runTesterJob(ctx context.Context, name, serviceAccount string,
 		},
 	}
 	if _, err := h.kube.BatchV1().Jobs(ns).Create(ctx, job, metav1.CreateOptions{}); err != nil {
-		return "", fmt.Errorf("create job %s: %w", name, err)
+		return fmt.Errorf("create job %s: %w", name, err)
 	}
+	return nil
+}
 
+func (h *Harness) waitTesterJob(ctx context.Context, name string, wantSuccess bool) (string, error) {
+	ns := h.opts.Namespace
 	var succeeded bool
 	if err := WaitFor(ctx, time.Second, 3*time.Minute, "tester job "+name, func() (bool, error) {
 		j, err := h.kube.BatchV1().Jobs(ns).Get(ctx, name, metav1.GetOptions{})

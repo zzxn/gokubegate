@@ -8,6 +8,14 @@ and exercise gokubegate from an in-cluster Job. The suite currently covers:
 - scale-up and scale-down EndpointSlice propagation (S3/S4);
 - NotReady removal and readiness restoration (S4);
 - successful minimal RBAC and fail-fast behavior without permissions (S5).
+- SSE stream affinity across concurrent long-lived streams (S6);
+- last-known-good routing while the kind control plane is paused (S7);
+- 1/8/32/64 concurrency gradients and sustained 64-way rapid scaling.
+
+The rapid-scaling scenario keeps one client active for 24 seconds while the
+Deployment receives `2 -> 8 -> 2 -> 6 -> 1 -> 4` replica updates every two
+seconds. It records per-second request/error/latency windows so a short outage
+cannot be hidden by aggregate success rates.
 
 ## Run
 

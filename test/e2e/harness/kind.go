@@ -107,3 +107,20 @@ func (h *Harness) DeleteCluster(ctx context.Context) {
 	_, _ = h.run(ctx, h.opts.KindPath, "delete", "cluster", "--name", h.opts.ClusterName)
 	_ = os.RemoveAll(h.cacheDir())
 }
+
+// PauseControlPlane makes the Kubernetes API server unavailable without
+// stopping worker-node pods, allowing last-known-good discovery tests.
+func (h *Harness) PauseControlPlane(ctx context.Context) error {
+	if _, err := h.run(ctx, "docker", "pause", h.opts.ClusterName+"-control-plane"); err != nil {
+		return fmt.Errorf("pause kind control plane: %w", err)
+	}
+	return nil
+}
+
+// ResumeControlPlane reverses PauseControlPlane.
+func (h *Harness) ResumeControlPlane(ctx context.Context) error {
+	if _, err := h.run(ctx, "docker", "unpause", h.opts.ClusterName+"-control-plane"); err != nil {
+		return fmt.Errorf("unpause kind control plane: %w", err)
+	}
+	return nil
+}

@@ -1,6 +1,9 @@
 package gokubegate
 
-import "math/rand/v2"
+import (
+	"math/rand/v2"
+	"sync/atomic"
+)
 
 // Strategy picks one backend per request from the current snapshot.
 // Implementations must be safe for concurrent use.
@@ -12,12 +15,14 @@ type Strategy interface {
 // starts at a random offset so that multiple processes do not synchronously
 // hammer the same backend.
 type RoundRobin struct {
-	counter uint64
+	counter atomic.Uint64
 }
 
 // NewRoundRobin creates a round-robin strategy with a random initial offset.
 func NewRoundRobin() *RoundRobin {
-	return &RoundRobin{counter: rand.Uint64()}
+	r := &RoundRobin{}
+	r.counter.Store(rand.Uint64())
+	return r
 }
 
 // Pick implements Strategy.
@@ -26,8 +31,7 @@ func (r *RoundRobin) Pick(backends []*PodBackend) *PodBackend {
 	if n == 0 {
 		return nil
 	}
-	r.counter++
-	return backends[r.counter%n]
+	return backends[r.counter.Add(1)%n]
 }
 
 // Random selects a backend uniformly at random.

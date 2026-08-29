@@ -2,6 +2,8 @@ package gokubegate
 
 import (
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -50,6 +52,32 @@ func TestRoundRobinEmpty(t *testing.T) {
 	rr := NewRoundRobin()
 	if b := rr.Pick(nil); b != nil {
 		t.Fatalf("expected nil for empty backend list, got %v", b)
+	}
+}
+
+func TestRoundRobinConcurrentIsBalanced(t *testing.T) {
+	rr := NewRoundRobin()
+	backends := mkBackends(4)
+	indices := make(map[*PodBackend]int, len(backends))
+	for i, backend := range backends {
+		indices[backend] = i
+	}
+	var counts [4]atomic.Int64
+	var wg sync.WaitGroup
+	for range 100 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 1_000 {
+				counts[indices[rr.Pick(backends)]].Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	for i := range counts {
+		if got := counts[i].Load(); got != 25_000 {
+			t.Fatalf("backend %d got %d concurrent picks, want 25000", i, got)
+		}
 	}
 }
 
