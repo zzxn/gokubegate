@@ -1,3 +1,5 @@
+> [English](./e2e-test-report-2026-08-29.md) | 简体中文
+
 # gokubegate 端到端测试报告
 
 ## 1. 结论

@@ -1,56 +1,58 @@
-# gokubegate 技术设计
+> [简体中文](./technical-design.zh.md)
 
-## 文档状态
+# gokubegate Technical Design
 
-- 状态：Draft v0.1
-- 日期：2026-08-29
-- 范围：gokubegate v0.1 核心库（集群内客户端负载均衡）
-- 本文是技术设计，不代表功能已经实现
+## Document status
 
-## 1. 背景与动机
+- Status: Draft v0.1
+- Date: 2026-08-29
+- Scope: gokubegate v0.1 core library (in-cluster client-side load balancing)
+- This document is a technical design; it does not imply that the features are implemented
 
-Kubernetes Service 的 ClusterIP 负载均衡是 L4 级别的：**只在 TCP 建连时选择一个 endpoint**。Go 的 `net/http.Transport` 会优先复用已有 keep-alive 连接，因此从集群内 Go 服务访问另一个服务时，请求会长期集中在少数 Pod 上。HTTP/2 的单连接多路复用会进一步放大这种连接级粘连。
+## 1. Background and motivation
 
-这类连接级粘连问题曾在生产网关中导致转发超时。此前团队验证的一系列缓解手段：
+Kubernetes Service ClusterIP load balancing happens at L4: **an endpoint is chosen only when a TCP connection is established**. Go's `net/http.Transport` prefers to reuse existing keep-alive connections, so when an in-cluster Go service calls another service, requests tend to concentrate on a small number of Pods for a long time. HTTP/2's single-connection multiplexing further amplifies this connection-level stickiness.
 
-- 扩大连接池、延长 idle timeout、降低 buffer —— 缓解建连压力；
-- 低比例随机 `Connection: close` 轮换 —— 缓解旧 endpoint 粘连。
+This connection-level stickiness has caused forwarding timeouts in production gateways. The mitigations the team previously validated:
 
-这些手段都只是**改善概率分布**，无法保证按请求在当前 Ready Pod 之间负载均衡。最终采用的方案是客户端侧基于 `EndpointSlice` 的按 Pod 负载均衡：请求前先选 Pod，直接拨 Pod 地址，每 Pod 维护独立连接池。
+- Larger connection pools, longer idle timeouts, smaller buffers — reduce connection-establishment pressure;
+- A low rate of random `Connection: close` rotation — reduce sticking to stale endpoints.
 
-**gokubegate 的目标是把这套已验证的能力抽成一个通用的、开箱即用的 Go 客户端库**，任何运行在集群内的 Go 服务都可以通过几行代码获得客户端级别的负载均衡，而不需要理解 informer、连接池、drain 等细节。
+These mitigations only **improve the probability distribution**; they cannot guarantee per-request load balancing across the currently Ready Pods. The final approach is client-side, per-Pod load balancing based on `EndpointSlice`: pick a Pod before the request, dial the Pod address directly, and keep a dedicated connection pool per Pod.
 
-## 2. 目标
+**gokubegate's goal is to extract this validated capability into a generic, out-of-the-box Go client library.** Any Go service running inside a cluster can get client-level load balancing with a few lines of code, without understanding informers, connection pools, drain, and similar details.
 
-1. 暴露极简 API：`gokubegate.NewClient(ctx, namespace, service, opts...)`，返回即可用的 `*http.Client` 包装。
-2. 自动完成：EndpointSlice 发现、Ready/terminating 过滤、客户端负载均衡、每 Pod 独立连接池、Pod 增删摘除。
-3. 与标准库 `net/http` 完全兼容（核心是 `http.RoundTripper`），普通请求、SSE 流式、长请求都可用。
-4. 默认零配置开箱即用；必要的定制全部通过可选参数（functional options）提供。
-5. 优雅生命周期：启动时等待 informer cache sync，关闭时优雅 drain 在途请求。
-6. Kubernetes API Server 短暂不可用时，继续用 last-known-good 快照转发，不中断业务。
-7. 可观测：事件 Hook 机制，由使用方自行实现指标/追踪/审计；默认零采集、零日志依赖。
-8. 一个 `Client` 对应一个下游 Service；多服务场景由用户组合多个 `Client`，不搞隐式聚合。
+## 2. Goals
 
-## 3. 非目标（v0.1 不包含）
+1. Expose a minimal API: `gokubegate.NewClient(ctx, namespace, service, opts...)` returning a ready-to-use `*http.Client` wrapper.
+2. Automatically handle: EndpointSlice discovery, Ready/terminating filtering, client-side load balancing, a dedicated connection pool per Pod, and Pod addition/removal.
+3. Be fully compatible with the standard library `net/http` (the core is an `http.RoundTripper`); ordinary requests, SSE streaming, and long requests all work.
+4. Work out of the box with zero configuration by default; all necessary customization goes through optional parameters (functional options).
+5. Graceful lifecycle: wait for informer cache sync at startup, gracefully drain in-flight requests on close.
+6. When the Kubernetes API server is briefly unavailable, keep forwarding from the last-known-good snapshot without interrupting traffic.
+7. Observability: an event hook mechanism; users implement metrics/tracing/auditing themselves. Zero collection and zero logging dependencies by default.
+8. One `Client` maps to one downstream Service; for multiple services, users compose multiple `Client`s rather than using implicit aggregation.
 
-- **不做跨 Pod 自动重试**：POST 等请求不可安全重放，自动重试会产生重复写入和故障放大；仅保留 `net/http.Transport` 自身对安全条件的有限重试。
-- 不做自适应权重、EWMA、熔断或复杂异常实例驱逐。
-- 不启用 HTTP/2 多路复用；但架构必须兼容未来按 Pod 启用 HTTP/2。
-- 不处理 Service Mesh mTLS/sidecar 的接入细节（文档给出约束与提示）。
-- 不替代 Kubernetes readiness probe，不自己实现健康检查。
-- 不要求无重启热切换配置（改配置 + 滚动发布即可）。
+## 3. Non-goals (not included in v0.1)
 
-## 4. 设计原则
+- **No automatic cross-Pod retries**: requests such as POST cannot be replayed safely; automatic retries cause duplicate writes and fault amplification. Only keep `net/http.Transport`'s own limited retries for safe conditions.
+- No adaptive weights, EWMA, circuit breaking, or complex unhealthy-instance eviction.
+- No HTTP/2 multiplexing enabled; the architecture must still allow per-Pod HTTP/2 in the future.
+- No Service Mesh mTLS/sidecar integration details (the document provides constraints and hints).
+- Does not replace the Kubernetes readiness probe; does not implement its own health checks.
+- No hot configuration reload without restart (change config + rolling deploy).
 
-- **借鉴 gRPC Resolver/Picker 的职责边界**：发现（Resolver）、连接（SubConn/Transport）、请求选择（Picker）三层解耦。
-- **请求热路径零锁**：快照用 `atomic.Pointer` 发布，Picker 只读快照，不访问 informer cache、不持有锁。
-- **每 Pod 独立 transport**：摘除时可定向 `CloseIdleConnections`，不与其他 Pod 争抢全局连接配额，天然兼容未来 HTTP/2。
-- **默认安全**：配置错误启动即失败；空 endpoint 返回明确错误，不静默 fallback 到 Service DNS。
-- **易用优先**：能自动解析的（端口、集群配置）就不让用户配置；接口先给默认值，再给扩展点。
+## 4. Design principles
 
-## 5. 快速上手
+- **Borrow the responsibility boundaries of gRPC Resolver/Picker**: discovery (Resolver), connections (SubConn/Transport), and request selection (Picker) are three decoupled layers.
+- **Zero locks on the request hot path**: snapshots are published with `atomic.Pointer`; the Picker only reads the snapshot and never touches the informer cache or holds locks.
+- **Dedicated transport per Pod**: on removal, call `CloseIdleConnections` on just that Pod, avoid contending for a global connection quota with other Pods, and be naturally compatible with future HTTP/2.
+- **Safe by default**: misconfiguration fails at startup; empty endpoints return a clear error instead of silently falling back to Service DNS.
+- **Ease of use first**: anything that can be resolved automatically (port, cluster config) is not exposed to the user; provide defaults first, then extension points.
 
-### 5.1 最简用法（集群内）
+## 5. Quick start
+
+### 5.1 Minimal usage (in-cluster)
 
 ```go
 package main
@@ -65,16 +67,16 @@ import (
 func main() {
     ctx := context.Background()
 
-    // 一行创建：自动 InClusterConfig、自动解析端口、默认 round-robin。
+    // One line: automatic InClusterConfig, automatic port resolution, default round-robin.
     client, err := gokubegate.NewClient(ctx, "demo", "demo-chat")
     if err != nil {
-        panic(err) // 配置错误 / RBAC 缺失 / cache sync 超时都会在这里暴露
+        panic(err) // config errors / missing RBAC / cache sync timeout all surface here
     }
-    defer client.Close() // 优雅 drain 在途请求并停止 informer
+    defer client.Close() // gracefully drain in-flight requests and stop the informer
 
     req, _ := http.NewRequestWithContext(ctx, http.MethodGet,
         "http://demo-chat.demo.svc.cluster.local:8888/demo/v2/chat/status", nil)
-    resp, err := client.Do(req) // 请求会被自动分发到某个 Ready Pod
+    resp, err := client.Do(req) // the request is automatically routed to a Ready Pod
     if err != nil {
         panic(err)
     }
@@ -83,36 +85,36 @@ func main() {
 }
 ```
 
-> `client` 内嵌 `*http.Client`，`Get/Post/Do` 等方法直接可用。
+> `client` embeds `*http.Client`, so methods like `Get`/`Post`/`Do` are directly available.
 
-### 5.2 需要定制时
+### 5.2 When customization is needed
 
 ```go
 client, err := gokubegate.NewClient(ctx, "demo", "demo-chat",
-    gokubegate.WithPort(8888),                           // 显式端口，跳过 Service 查询
-    gokubegate.WithStrategy(gokubegate.StrategyRandom),  // 默认 RoundRobin
+    gokubegate.WithPort(8888),                           // explicit port, skip the Service lookup
+    gokubegate.WithStrategy(gokubegate.StrategyRandom),  // default is RoundRobin
     gokubegate.WithCacheSyncTimeout(30*time.Second),
     gokubegate.WithLogger(slog.Default()),
 )
 ```
 
-### 5.3 高级用法：自己组合 http.Client
+### 5.3 Advanced usage: composing your own http.Client
 
 ```go
-// 拿裸 RoundTripper，多个 http.Client 共享同一 Gate 和连接池。
+// Get the bare RoundTripper; multiple http.Clients share the same Gate and connection pools.
 gate, err := gokubegate.NewGate(ctx, "demo", "demo-chat")
 if err != nil {
     panic(err)
 }
 defer gate.Close()
 
-short := &http.Client{Transport: gate, Timeout: 10 * time.Second}  // 普通请求
-stream := &http.Client{Transport: gate, Timeout: 0}                // SSE 流式，无全局超时
+short := &http.Client{Transport: gate, Timeout: 10 * time.Second}  // ordinary requests
+stream := &http.Client{Transport: gate, Timeout: 0}                // SSE streaming, no global timeout
 ```
 
-关键点：`http.Client.Timeout` 是 client 层的，`RoundTripper` 只管连接与分发，因此**同一个 Gate 可以被不同超时语义的多个 http.Client 共享**，这正是内部网关中 normal/admin/SSE 三类 profile 的通用化替代，无需为每类请求复制连接池。
+Key point: `http.Client.Timeout` lives at the client layer while `RoundTripper` only manages connections and dispatch, so **the same Gate can be shared by multiple `http.Client`s with different timeout semantics**. This is a generalized replacement for the normal/admin/SSE three profiles in an internal gateway, without duplicating a connection pool per request class.
 
-### 5.4 所需 RBAC（文档给使用者）
+### 5.4 Required RBAC (for users)
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -125,7 +127,7 @@ rules:
     resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
-    resources: ["services"]   # 仅当未显式 WithPort、需要自动解析端口时
+    resources: ["services"]   # only when WithPort is not set and the port must be auto-resolved
     verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -135,7 +137,7 @@ metadata:
   namespace: demo
 subjects:
   - kind: ServiceAccount
-    name: <你的应用 ServiceAccount>
+    name: <your application ServiceAccount>
     namespace: demo
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -143,7 +145,7 @@ roleRef:
   name: gokubegate-endpointslice-reader
 ```
 
-## 6. 总体架构
+## 6. Overall architecture
 
 ```mermaid
 flowchart LR
@@ -154,40 +156,40 @@ flowchart LR
     P --> B1[PodBackend A]
     P --> B2[PodBackend B]
     P --> B3[PodBackend C]
-    B1 --> T1[独立 Transport]
-    B2 --> T2[独立 Transport]
-    B3 --> T3[独立 Transport]
+    B1 --> T1[Dedicated Transport]
+    B2 --> T2[Dedicated Transport]
+    B3 --> T3[Dedicated Transport]
 
-    U[用户 http.Client] -->|RoundTrip| G[Gate]
+    U[User http.Client] -->|RoundTrip| G[Gate]
     G --> P
 ```
 
-核心约束：
+Core constraints:
 
-- informer/reconciler 与请求热路径完全隔离；请求只读快照。
-- 每 Pod 一个 `PodBackend`（含独立 transport），连接不跨 Pod 复用。
-- 请求不经过 Service ClusterIP，直接拨 Pod IP；逻辑 Host 保持不变。
-- 没有 Pod 可用时 `RoundTrip` 返回类型化错误 `ErrNoEndpoints`，绝不静默降级。
+- The informer/reconciler is fully isolated from the request hot path; requests only read snapshots.
+- One `PodBackend` (with a dedicated transport) per Pod; connections are never reused across Pods.
+- Requests do not go through the Service ClusterIP; they dial Pod IPs directly while keeping the logical Host unchanged.
+- When no Pod is available, `RoundTrip` returns the typed error `ErrNoEndpoints` and never silently degrades.
 
-## 7. 核心组件设计
+## 7. Core component design
 
-### 7.1 Discovery（发现）
+### 7.1 Discovery
 
-- 默认使用 `rest.InClusterConfig()`；提供 `WithRESTConfig` / `WithKubeConfig` 支持本地调试与测试。
-- 用 `client-go` 的 `SharedInformerFactory` 只 watch `discovery.k8s.io/v1 EndpointSlice`，以 `kubernetes.io/service-name=<service>` label 过滤。
-- 端口解析优先级：
-  1. `WithPort(n)` 显式端口；
-  2. `WithPortName(name)`：启动时 GET 一次 Service，按 port name 解析；
-  3. 默认：启动时 GET 一次 Service，取第一个 TCP 端口。
-  - 端口解析同时充当 Service 存在性校验；显式 `WithPort` 时跳过 Service 查询（用户已断言）。
-- 端点聚合规则（每次 reconcile 合并该 Service 的全部 EndpointSlice）：
-  - 入选条件：`ready != false AND terminating != true`（nil 遵循 K8s 语义：`ready==nil` 视为 true，`terminating==nil` 视为 false）；
-  - 端口：匹配配置端口且协议为 TCP 或 nil；缺失/冲突则忽略该 endpoint 并记录指标；
-  - 地址：支持 IPv4/IPv6（`net.JoinHostPort`）；第一阶段忽略 FQDN address type；
-  - 一个 endpoint 含多个地址时，每个地址作为独立 backend；
-  - backend key：`namespace/service/targetRef.uid/address/port`，UID 缺失时退化为 `namespace/service/address/port`。
+- Defaults to `rest.InClusterConfig()`; `WithRESTConfig` / `WithKubeConfig` are provided for local debugging and tests.
+- Uses client-go's `SharedInformerFactory` to watch only `discovery.k8s.io/v1 EndpointSlice`, filtered by the `kubernetes.io/service-name=<service>` label.
+- Port resolution priority:
+  1. `WithPort(n)` explicit port;
+  2. `WithPortName(name)`: GET the Service once at startup and resolve by port name;
+  3. Default: GET the Service once at startup and take the first TCP port.
+  - Port resolution also validates that the Service exists; an explicit `WithPort` skips the Service lookup (the user asserts it).
+- Endpoint aggregation rules (each reconcile merges all EndpointSlices for that Service):
+  - Inclusion: `ready != false AND terminating != true` (nil follows K8s semantics: `ready==nil` is treated as true, `terminating==nil` as false);
+  - Port: matches the configured port and the protocol is TCP or nil; otherwise the endpoint is ignored and a metric is recorded;
+  - Address: IPv4/IPv6 are supported (`net.JoinHostPort`); the FQDN address type is ignored in this phase;
+  - When one endpoint has multiple addresses, each address becomes an independent backend;
+  - Backend key: `namespace/service/targetRef.uid/address/port`, degrading to `namespace/service/address/port` when the UID is missing.
 
-### 7.2 EndpointSnapshot（不可变快照）
+### 7.2 EndpointSnapshot (immutable snapshot)
 
 ```go
 type EndpointSnapshot struct {
@@ -197,11 +199,11 @@ type EndpointSnapshot struct {
 }
 ```
 
-- 通过 `atomic.Pointer[EndpointSnapshot]` 发布与读取。
-- 请求路径**禁止**直接读 informer cache，避免 K8s 对象锁和聚合开销进入热路径。
-- 发布前按 backend key 稳定排序，保证测试可重复、round-robin 行为可预期。
+- Published and read via `atomic.Pointer[EndpointSnapshot]`.
+- The request path **must not** read the informer cache directly, to keep K8s object locks and aggregation overhead off the hot path.
+- Before publishing, backends are stably sorted by backend key to keep tests reproducible and round-robin behavior predictable.
 
-### 7.3 Picker（负载均衡策略）
+### 7.3 Picker (load-balancing strategy)
 
 ```go
 type Strategy interface {
@@ -209,12 +211,12 @@ type Strategy interface {
 }
 ```
 
-- `StrategyRoundRobin`（默认）：每个 Client 独立原子计数器，`index := counter.Add(1)`，`backend := backends[index%len(backends)]`；计数器初始值用进程内随机偏移，避免多个副本同时冲击同一 Pod。
-- `StrategyRandom`：`rand.IntN`。
-- 策略接口开放，后续可加 P2C / least-request（需先定义 SSE、长请求、短请求各自的"负载"语义）。
-- Picker 只读快照，不执行 DNS、锁等待或健康检查。
+- `StrategyRoundRobin` (default): each Client has an independent atomic counter, `index := counter.Add(1)`, `backend := backends[index%len(backends)]`; the counter starts from an in-process random offset so multiple replicas don't all hit the same Pod at once.
+- `StrategyRandom`: `rand.IntN`.
+- The strategy interface is open; P2C / least-request can be added later (the "load" semantics for SSE, long requests, and short requests must be defined first).
+- The Picker only reads the snapshot; it does no DNS, lock waiting, or health checks.
 
-### 7.4 PodBackend（每 Pod 连接池）
+### 7.4 PodBackend (per-Pod connection pool)
 
 ```go
 type PodBackend struct {
@@ -229,31 +231,31 @@ type PodBackend struct {
 }
 ```
 
-- **单 transport profile**（区别于内部网关常见的 normal/admin/SSE 三 profile）：client 级超时由用户的 `http.Client` 决定，transport 只需管理连接；同一 Gate 可被多个超时语义不同的 client 共享（见 5.3）。这是通用库相对内部网关的简化与泛化。
-- transport 参数（默认值，均可通过选项覆盖）：
-  - `MaxIdleConns` / `MaxIdleConnsPerHost`：`maxIdleConnsPerPod`（默认 32），两值设为相同；
-  - `IdleConnTimeout`：90s；`DialContext.Timeout`：5s；`TCPKeepAlive`：30s；
-  - `ResponseHeaderTimeout`：15s（SSE 也适用，只影响首个响应头等待）；
-  - `MaxConnsPerHost`：0（不设硬上限，避免客户端隐式排队等待）；
-  - `ForceAttemptHTTP2`：false（见 8.4）。
-- **连接预算**（文档约束使用者）：`下游 Pod 数 × 每 Pod idle 上限 × 使用该库的副本数`，默认值 32 是安全起点，需按峰值并发压测确定：`maxIdleConnsPerPod >= 每 Pod 峰值 RPS × 下游 P99 秒数 × 1.5~2`。
-- 不按请求创建 transport；transport 与 PodBackend 同生命周期。
+- **Single transport profile** (unlike the normal/admin/SSE three profiles common in an internal gateway): client-level timeouts are decided by the user's `http.Client`; the transport only manages connections. The same Gate can be shared by multiple clients with different timeout semantics (see 5.3). This is the simplification and generalization over an internal gateway.
+- Transport parameters (defaults, all overridable via options):
+  - `MaxIdleConns` / `MaxIdleConnsPerHost`: `maxIdleConnsPerPod` (default 32), set to the same value;
+  - `IdleConnTimeout`: 90s; `DialContext.Timeout`: 5s; `TCPKeepAlive`: 30s;
+  - `ResponseHeaderTimeout`: 15s (applies to SSE too, only affects waiting for the first response header);
+  - `MaxConnsPerHost`: 0 (no hard cap, avoids implicit queueing/waiting in the client);
+  - `ForceAttemptHTTP2`: false (see 8.4).
+- **Connection budget** (documented constraint for users): `downstream Pods × max idle per Pod × replicas using the library`; the default of 32 is a safe starting point, to be tuned by peak-concurrency load testing: `maxIdleConnsPerPod >= per-Pod peak RPS × downstream P99 seconds × 1.5~2`.
+- No per-request transport; the transport shares the PodBackend's lifecycle.
 
-### 7.5 Gate（http.RoundTripper）
+### 7.5 Gate (http.RoundTripper)
 
-`Gate` 实现 `RoundTrip(req *http.Request) (*http.Response, error)`，流程：
+`Gate` implements `RoundTrip(req *http.Request) (*http.Response, error)`. Flow:
 
-1. `atomic.Load` 当前快照；为空返回 `ErrNoEndpoints`；
-2. Picker 选择一个 backend；
-3. `backend.inflight.Add(1)`；
-4. 克隆请求（浅拷贝 + 克隆 URL），按 8.1 规则改写 URL/Host；
-5. `backend.transport.RoundTrip(req)`；
-6. 成功：包装 `resp.Body`，在首次 `Close` 时 `inflight.Add(-1)`（幂等）；失败且无 response：立即 `inflight.Add(-1)`；
-7. 发出事件（`endpoint_picked`、`request_done`）。
+1. `atomic.Load` the current snapshot; return `ErrNoEndpoints` if empty;
+2. The Picker selects a backend;
+3. `backend.inflight.Add(1)`;
+4. Clone the request (shallow copy + cloned URL) and rewrite URL/Host per the rules in 8.1;
+5. `backend.transport.RoundTrip(req)`;
+6. On success: wrap `resp.Body` and `inflight.Add(-1)` on the first `Close` (idempotent); on failure with no response: `inflight.Add(-1)` immediately;
+7. Emit events (`endpoint_picked`, `request_done`).
 
-并发安全：Gate 可被多个 goroutine / 多个 http.Client 并发使用。
+Concurrency safety: a Gate can be used concurrently by multiple goroutines / multiple `http.Client`s.
 
-### 7.6 Client（易用封装）
+### 7.6 Client (convenience wrapper)
 
 ```go
 type Client struct {
@@ -261,170 +263,170 @@ type Client struct {
     gate *Gate
 }
 
-func (c *Client) Close() error          // 停 informer → drain 全部 backend → 释放
-func (c *Client) Endpoints() []EndpointInfo // 当前快照（调试/观测）
-func (c *Client) Mode() string          // "pod" 或 "clusterip"
+func (c *Client) Close() error              // stop informer → drain all backends → release
+func (c *Client) Endpoints() []EndpointInfo // current snapshot (debug/observation)
+func (c *Client) Mode() string              // "pod" or "clusterip"
 ```
 
-`NewClient` 阻塞直到 informer cache sync（默认 20s，可配），保证返回的 client 立即可用；失败返回明确错误（配置、RBAC、超时）。
+`NewClient` blocks until the informer cache syncs (default 20s, configurable), guaranteeing the returned client is immediately usable; failures return a clear error (config, RBAC, timeout).
 
-## 8. 请求改写规则
+## 8. Request rewriting rules
 
 ### 8.1 URL / Host
 
 ```text
-用户构造: http://demo-chat.demo.svc.cluster.local:8888/demo/v2/chat/status
-实际拨号: http://10.0.1.23:8888/demo/v2/chat/status
-HTTP Host: demo-chat.demo.svc.cluster.local:8888
+User constructs: http://demo-chat.demo.svc.cluster.local:8888/demo/v2/chat/status
+Actual dial:      http://10.0.1.23:8888/demo/v2/chat/status
+HTTP Host:        demo-chat.demo.svc.cluster.local:8888
 ```
 
-规则：
+Rules:
 
-1. 克隆请求，不原地修改；
-2. `req.URL.Scheme` 保留逻辑 scheme（空则用 `WithScheme`，默认 http）；
-3. `req.URL.Host` 改为选中 Pod 的 `host:port`；
-4. `req.Host` 显式设置为逻辑 Service authority（`<service>.<namespace>.svc.<clusterDomain>`，默认 `cluster.local`，可用 `WithClusterDomain` 覆盖）；若用户已显式设置 `req.Host` 则尊重用户值；
-5. path / raw path / query 保持不变；
-6. 继续传播用户设置的 header（request ID 等由业务层负责）。
+1. Clone the request; do not modify it in place;
+2. `req.URL.Scheme` keeps the logical scheme (empty uses `WithScheme`, default http);
+3. `req.URL.Host` is changed to the selected Pod's `host:port`;
+4. `req.Host` is explicitly set to the logical Service authority (`<service>.<namespace>.svc.<clusterDomain>`, default `cluster.local`, overridable with `WithClusterDomain`); if the user already set `req.Host`, respect the user's value;
+5. path / raw path / query stay unchanged;
+6. User-set headers continue to propagate (request IDs etc. are the caller's responsibility).
 
-未来 HTTPS：TLS `ServerName` 使用逻辑 Service hostname 而非 Pod IP，证书必须覆盖 Service hostname。
+Future HTTPS: TLS `ServerName` uses the logical Service hostname rather than the Pod IP; the certificate must cover the Service hostname.
 
-### 8.2 为什么不直接用 Service DNS
+### 8.2 Why not use Service DNS directly
 
-Service DNS 的负载均衡发生在 TCP 建连时；复用 keep-alive 后请求不再重新分配。直接拨 Pod IP 才能做到**按请求**均衡，这也是本库的核心价值。
+Service DNS load balancing happens at TCP connection establishment; once a keep-alive connection is reused, requests are no longer rebalanced. Only dialing Pod IPs directly achieves **per-request** balancing — this is the core value of the library.
 
-### 8.3 空 endpoint / 失败
+### 8.3 Empty endpoints / failure
 
-- 空快照：`RoundTrip` 返回 `ErrNoEndpoints`（`errors.Is` 可判断），快速失败，不 fallback、不重试。
-- 单个 backend 拨号失败：错误返回给调用方，由调用方决定重试（见 10.4）。
+- Empty snapshot: `RoundTrip` returns `ErrNoEndpoints` (detectable via `errors.Is`), fails fast, no fallback, no retry.
+- A single backend dial failure: the error is returned to the caller, who decides whether to retry (see 10.4).
 
 ### 8.4 HTTP/2
 
-v0.1 不启用 HTTP/2（`ForceAttemptHTTP2: false`）。原因同内部网关设计：L4 模式下 HTTP/2 长连接多路复用会把流量粘在少数 endpoint。每 Pod 独立 transport 的架构已为"按 Pod 启用 HTTP/2"留好隔离边界；将来接入能按请求重新均衡的机制（如 Service Mesh 或明确端到端 HTTP/2）时再评估。
+v0.1 does not enable HTTP/2 (`ForceAttemptHTTP2: false`). The reason matches the internal gateway design: under L4 mode, HTTP/2 long-connection multiplexing sticks traffic to a small number of endpoints. The per-Pod transport architecture already provides an isolation boundary for enabling HTTP/2 per Pod; revisit it once a mechanism that can rebalance per request (such as a Service Mesh or explicit end-to-end HTTP/2) is available.
 
-## 9. 生命周期
+## 9. Lifecycle
 
-### 9.1 启动
+### 9.1 Startup
 
-1. 创建 REST config（InClusterConfig 或显式注入）；
-2. 创建 clientset + SharedInformerFactory（仅 EndpointSlice informer；需要端口解析时额外 GET 一次 Service，不 watch）；
-3. 启动 informer，等待 cache sync，超时（默认 20s）则返回错误；
-4. 初始化快照、Picker、Gate；
-5. `NewClient` 返回可用 client。
+1. Build the REST config (InClusterConfig or explicitly injected);
+2. Create the clientset + SharedInformerFactory (only the EndpointSlice informer; when port resolution is needed, GET the Service once, no watch);
+3. Start the informer and wait for cache sync; on timeout (default 20s), return an error;
+4. Initialize the snapshot, Picker, and Gate;
+5. `NewClient` returns a usable client.
 
-### 9.2 运行期 reconcile
+### 9.2 Runtime reconcile
 
-- informer 事件回调只把对应 Service 入队，不做阻塞操作；
-- reconcile 串行执行：读 informer cache → 计算新 backend 集合 → 复用未变化 backend、创建新增 backend、标记删除 backend → 原子发布新快照 → 异步 drain 被摘除的 backend；
-- 新增 backend 不预热（避免扩容惊群），第一条请求按需建连。
+- Informer event callbacks only enqueue the corresponding Service; they do no blocking work;
+- Reconcile runs serially: read the informer cache → compute the new backend set → reuse unchanged backends, create new backends, mark removed backends → atomically publish the new snapshot → asynchronously drain removed backends;
+- New backends are not pre-warmed (to avoid a thundering herd on scale-up); the first request establishes connections on demand.
 
-### 9.3 摘除与 drain
+### 9.3 Removal and drain
 
-endpoint NotReady / terminating / 从 EndpointSlice 消失时：
+When an endpoint becomes NotReady / terminating / disappears from EndpointSlice:
 
-1. 从新快照移除，立即停止接收新请求；
-2. `draining = true`；
-3. `transport.CloseIdleConnections()`；
-4. 在途请求继续执行，不主动打断 active 连接；
-5. 等待 `inflight == 0` 或达到 `drainTimeoutSeconds`（默认 30s，可配）；
-6. 再次 `CloseIdleConnections()`（处理摘除时仍 active、随后回到 idle pool 的连接）并从 registry 删除引用；
-7. 达到 drain 超时仍不打断业务请求，对象保留到 inflight 归零并记录超时指标。
+1. Remove it from the new snapshot and stop accepting new requests immediately;
+2. `draining = true`;
+3. `transport.CloseIdleConnections()`;
+4. In-flight requests continue; active connections are not forcibly interrupted;
+5. Wait until `inflight == 0` or `drainTimeoutSeconds` (default 30s, configurable);
+6. Call `CloseIdleConnections()` again (to handle connections that were still active during removal and later returned to the idle pool) and drop the reference from the registry;
+7. Even on drain timeout, in-flight requests are not interrupted; the object is kept until inflight reaches zero and a timeout metric is recorded.
 
-### 9.4 Close（优雅关闭）
+### 9.4 Close (graceful shutdown)
 
-1. 停止 informer（stop channel）；
-2. 对全部 backend 执行 drain（同 9.3）；
-3. 关闭并释放资源；
-4. `Close` 幂等，可多次调用。
+1. Stop the informer (stop channel);
+2. Drain all backends (same as 9.3);
+3. Close and release resources;
+4. `Close` is idempotent and can be called multiple times.
 
-## 10. 失败处理
+## 10. Failure handling
 
-### 10.1 启动失败（fail fast）
+### 10.1 Startup failure (fail fast)
 
-以下情况 `NewClient`/`NewGate` 返回错误：
+`NewClient`/`NewGate` return an error when:
 
-- 无法创建 in-cluster REST config（且未显式注入）；
-- EndpointSlice informer 首次 cache sync 超时；
-- 配置不完整（namespace/service 为空）、端口非法；
-- RBAC 导致 list/watch 被拒绝。
+- The in-cluster REST config cannot be created (and none was explicitly injected);
+- The EndpointSlice informer's first cache sync times out;
+- The config is incomplete (empty namespace/service) or the port is invalid;
+- RBAC rejects the list/watch.
 
-发布系统能据此明确发现配置或权限错误，而不是静默降级。
+This lets the deployment system clearly detect config or permission errors instead of silently degrading.
 
-### 10.2 API Server 短暂不可用
+### 10.2 API server briefly unavailable
 
-informer 完成首次同步后 list/watch 断开：
+After the informer completes its first sync and the list/watch is disconnected:
 
-- 继续使用 last-known-good 快照转发；
-- informer 自动重连；
-- 指标暴露距上次成功同步的时间与 watch 错误；
-- **不**自动切换回 Service DNS。
+- Keep forwarding with the last-known-good snapshot;
+- The informer reconnects automatically;
+- Metrics expose the time since the last successful sync and watch errors;
+- **Do not** automatically switch back to Service DNS.
 
-### 10.3 空 endpoint
+### 10.3 Empty endpoints
 
-- 首次同步成功但服务无可用 endpoint：`ErrNoEndpoints`；
-- 运行中收到权威空集合：同样快速失败，不选择 NotReady/terminating endpoint，不 fallback。
+- First sync succeeds but the Service has no usable endpoint: `ErrNoEndpoints`;
+- An authoritative empty set arrives at runtime: fail fast the same way; never select NotReady/terminating endpoints and never fall back.
 
-### 10.4 请求失败与重试
+### 10.4 Request failure and retry
 
-- v0.1 不增加跨 Pod 重试：body 不保证可重放；
-- 保留 `net/http.Transport` 对安全条件请求的有限重试；
-- 若未来增加跨 Pod retry，必须同时满足：方法幂等或带 idempotency key、`Request.GetBody` 可重放、能判断失败发生在安全阶段、重试次数与总 deadline 硬上限、重试排除刚失败的 endpoint。
+- v0.1 adds no cross-Pod retry: bodies are not guaranteed to be replayable;
+- Keep `net/http.Transport`'s limited retries for requests in safe conditions;
+- If cross-Pod retry is added in the future, all of the following must hold: the method is idempotent or carries an idempotency key, `Request.GetBody` can replay the body, the failure can be determined to have occurred in a safe phase, retry count and total deadline have hard caps, and retries exclude the endpoint that just failed.
 
-## 11. 可观测性
+## 11. Observability
 
-### 11.1 设计原则：Hook 事件，默认零采集
+### 11.1 Design principle: hook events, zero collection by default
 
-核心库**不内置指标实现，也不依赖任何 metrics 库**。可观测能力通过事件 Hook 暴露，由使用方自行实现指标、追踪或审计，类似 `slog.Logger`：默认无输出，按需注入。
+The core library **does not embed any metrics implementation and does not depend on any metrics library**. Observability is exposed through event hooks; users implement metrics, tracing, or auditing themselves, similar to `slog.Logger`: no output by default, inject on demand.
 
 ```go
-// Hook 接收 gokubegate 运行时事件；实现必须快速返回，不得阻塞请求路径。
+// Hook receives gokubegate runtime events; implementations must return fast and must not block the request path.
 type Hook interface {
     Handle(Event)
 }
 
 type Event struct {
     Kind     EventKind
-    Service  string        // 目标服务
-    Endpoint string        // 短标签（Pod 名或地址 hash）
-    Ready    int           // endpoints_updated：Ready 数量
-    Draining int           // endpoints_updated：draining 数量
-    Result   string        // 结果：success/error/completed/timeout
-    Reused   bool          // request_done：连接是否复用
-    Err      error         // reconcile 失败原因
-    Duration time.Duration // request_done：往返耗时
+    Service  string        // target service
+    Endpoint string        // short label (Pod name or address hash)
+    Ready    int           // endpoints_updated: Ready count
+    Draining int           // endpoints_updated: draining count
+    Result   string        // result: success/error/completed/timeout
+    Reused   bool          // request_done: whether the connection was reused
+    Err      error         // reconcile failure reason
+    Duration time.Duration // request_done: round-trip duration
 }
 ```
 
-事件类型：
+Event types:
 
-| EventKind | 触发时机 | 主要字段 |
+| EventKind | Trigger | Main fields |
 | --- | --- | --- |
-| `endpoints_updated` | 快照 reconcile 后 | Ready, Draining |
-| `endpoint_picked` | 每次请求选择 endpoint 后 | Endpoint |
-| `request_done` | 请求完成（响应或错误） | Endpoint, Result, Reused, Duration |
-| `reconcile` | 每次 reconcile 尝试 | Result, Err |
-| `endpoint_drained` | 摘除的 endpoint drain 完成/超时 | Endpoint, Result |
+| `endpoints_updated` | after snapshot reconcile | Ready, Draining |
+| `endpoint_picked` | after each request picks an endpoint | Endpoint |
+| `request_done` | request completes (response or error) | Endpoint, Result, Reused, Duration |
+| `reconcile` | each reconcile attempt | Result, Err |
+| `endpoint_drained` | a removed endpoint's drain completes/times out | Endpoint, Result |
 
-注册方式：
+Registration:
 
 ```go
 client, err := gokubegate.NewClient(ctx, "demo", "demo-chat",
-    gokubegate.WithHook(prometheusHook),      // 可注册多个
+    gokubegate.WithHook(prometheusHook),      // multiple hooks can be registered
     gokubegate.WithHook(auditHook),
 )
 ```
 
-默认无任何 Hook（零开销）；`WithHooks(...)` 可一次注册多个。Hook 按注册顺序同步调用，实现方不要把耗时操作放进 `Handle`。
+No hooks by default (zero overhead); `WithHooks(...)` registers multiple at once. Hooks are invoked synchronously in registration order; implementers must not put slow operations in `Handle`.
 
-### 11.2 日志
+### 11.2 Logging
 
-- 默认**不输出任何日志**（discard handler）；
-- `WithLogger(*slog.Logger)` 注入自己的 logger；
-- `WithDebug()` 开启内部 debug 日志（写 stderr）。
+- No log output by default (discard handler);
+- `WithLogger(*slog.Logger)` injects your own logger;
+- `WithDebug()` enables internal debug logging (writes to stderr).
 
-### 11.3 使用方实现示例（Prometheus）
+### 11.3 Example implementation (Prometheus)
 
-库本身不提供 Prometheus 适配；下面是一段基于 Hook 的最小实现思路（M2 会在 `examples/` 提供完整示例）：
+The library itself does not provide a Prometheus adapter; the following is a minimal implementation sketch based on hooks (M2 will provide a full example under `examples/`):
 
 ```go
 type promHook struct{ requests *prometheus.CounterVec }
@@ -439,108 +441,93 @@ func (h *promHook) Handle(e gokubegate.Event) {
 }
 ```
 
-- `endpoint` 标签用短 Pod 名或稳定短 hash，基数上限 ≈ 滚动窗口内 Pod 数；
-- 正常请求不写日志，只发事件；事件不含用户数据与 bearer token。
+- The `endpoint` label uses a short Pod name or a stable short hash; cardinality is bounded by roughly the number of Pods in the rolling window;
+- Ordinary requests do not write logs, only events; events contain no user data or bearer tokens.
 
-## 12. 安全与网络约束
+## 12. Security and network constraints
 
-- 仅需目标 namespace 的 EndpointSlice 只读权限（+ 可选 Services get）；不给 Pod/Secret/ConfigMap 权限；
-- NetworkPolicy 必须允许本应用直连下游 Pod CIDR 和目标端口；
-- 若集群使用 Service Mesh sidecar，需确认 Pod IP 直连仍经过预期 mTLS/sidecar 路径；未确认前不建议启用；
-- 日志与指标不记录 bearer token。
+- Only read-only EndpointSlice permission in the target namespace is required (+ optional Services get); no Pod/Secret/ConfigMap permissions;
+- NetworkPolicy must allow the application to connect directly to the downstream Pod CIDR and target port;
+- If the cluster uses a Service Mesh sidecar, verify that direct Pod-IP dialing still goes through the expected mTLS/sidecar path; do not enable it until confirmed;
+- Logs and metrics must not record bearer tokens.
 
-## 13. 测试设计
+## 13. Testing design
 
-### 13.1 单元测试（fake clientset）
+### 13.1 Unit tests (fake clientset)
 
-- 端点聚合：多 EndpointSlice 合并、忽略其他 Service、`ready/terminating` 的 nil/true/false、IPv4/IPv6、多端口、缺失端口、UID 复用 IP；
-- Picker：N 个 endpoint 的 round-robin 分布、随机初始偏移、空快照、draining 不被选中；
-- Backend：同 endpoint 复用 transport、不同 endpoint 不共享、Body Close 后 inflight 幂等递减、drain 不打断 active 请求；
-- Gate：请求改写（URL.Host、req.Host、query 保留）、`ErrNoEndpoints`；
-- 并发：`go test -race` 覆盖并发请求 + 快照替换。
+- Endpoint aggregation: merging multiple EndpointSlices, ignoring other Services, `ready/terminating` nil/true/false, IPv4/IPv6, multiple ports, missing ports, UID reusing an IP;
+- Picker: round-robin distribution over N endpoints, random initial offset, empty snapshot, draining backends not selected;
+- Backend: same endpoint reuses transport, different endpoints do not share, inflight idempotent decrement after Body Close, drain does not interrupt active requests;
+- Gate: request rewriting (URL.Host, req.Host, query preserved), `ErrNoEndpoints`;
+- Concurrency: `go test -race` covers concurrent requests + snapshot replacement.
 
-### 13.2 集成测试（envtest / kind）
+### 13.2 Integration tests (envtest / kind)
 
-- 多副本测试服务返回自身 identity，验证：短请求下各 endpoint pick 数差值 ≤ 1；连接复用；扩容后新 Pod 开始接流量；缩容/NotReady 后停止接流量且在途完成；API Server 抖动时 last-known-good。
-- 持续并发：单个长生命周期 Client 在 64 并发下每 2 秒执行一次 `2→8→2→6→1→4`，按秒记录请求数、错误率和 p95，禁止完整秒级全断；
-- SSE：20 条并发长流逐事件校验 Pod identity，一条流内不得切换 Pod，新流在 Ready Pod 间均衡；
-- 控制面故障：持续流量期间暂停 kind control-plane 5 秒，验证 last-known-good 快照零错误转发；
-- 并发梯度：1/8/32/64 worker 分别记录吞吐、连接复用率和 p50/p95/p99/max。
+- A multi-replica test service returns its own identity, verifying: short requests keep per-endpoint pick counts within 1 of each other; connection reuse; new Pods start receiving traffic after scale-up; scaled-down/NotReady Pods stop receiving traffic while in-flight requests complete; last-known-good during API server disruption.
+- Sustained concurrency: a single long-lived Client at 64 concurrency runs `2→8→2→6→1→4` every 2 seconds, recording per-second request counts, error rate, and p95; a full-second total outage is forbidden.
+- SSE: 20 concurrent long streams verify Pod identity per event; a single stream must not switch Pods; new streams balance across Ready Pods.
+- Control-plane failure: pause the kind control-plane for 5 seconds during sustained traffic and verify zero-error forwarding from the last-known-good snapshot.
+- Concurrency gradient: 1/8/32/64 workers each record throughput, connection reuse ratio, and p50/p95/p99/max.
 
-### 13.3 性能与稳定性
+### 13.3 Performance and stability
 
-- 目标峰值 2 倍压测；记录各 Pod RPS、P50/P90/P99、复用率、新建连接速率；
-- 扩缩容 2N / N/2、上游与下游同时滚动发布；
-- 统计 FD、goroutine、heap、总 idle 连接，验证连接预算。
+- Load test at 2× target peak; record per-Pod RPS, P50/P90/P99, reuse ratio, and new-connection rate;
+- Scale 2N / N/2, and rolling-deploy upstream and downstream simultaneously;
+- Count FDs, goroutines, heap, and total idle connections to verify the connection budget.
 
-## 14. 代码组织（规划）
+## 14. Code organization (planned)
 
 ```text
 gokubegate/
-  client.go       // Client 封装（NewClient、Close、Endpoints）
-  gate.go         // Gate：http.RoundTripper、请求改写
-  discovery.go    // EndpointSlice informer + reconciler + 端口解析
-  snapshot.go     // EndpointSnapshot、EndpointKey
-  picker.go       // Strategy 接口 + RoundRobin/Random
-  backend.go      // PodBackend、transport、drain
-  options.go      // 全部 functional options 与默认值
-  hooks.go        // Hook 接口 + Event 类型
-  errors.go       // ErrNoEndpoints 等类型化错误
+  client.go       // Client wrapper (NewClient, Close, Endpoints)
+  gate.go         // Gate: http.RoundTripper, request rewriting
+  discovery.go    // EndpointSlice informer + reconciler + port resolution
+  snapshot.go     // EndpointSnapshot, EndpointKey
+  picker.go       // Strategy interface + RoundRobin/Random
+  backend.go      // PodBackend, transport, drain
+  options.go      // all functional options and defaults
+  hooks.go        // Hook interface + Event types
+  errors.go       // ErrNoEndpoints and other typed errors
   *_test.go
 ```
 
-## 15. 里程碑
+## 15. Milestones
 
-- **M1（核心可用）**：上述包 + 单测；`NewClient`/`NewGate` 可用；默认配置通过；RBAC 文档。
-- **M2（示例与集成）**：基于 Hook 的 Prometheus 示例（`examples/`）；envtest/kind 集成测试；扩缩容用例。
-- **M3（发布）**：压测定容量；README 与示例完善；打 tag 发布 v0.1。
+- **M1 (usable core)**: the packages above + unit tests; `NewClient`/`NewGate` usable; default config passes; RBAC docs.
+- **M2 (examples and integration)**: hook-based Prometheus example (`examples/`); envtest/kind integration tests; scale-up/scale-down cases.
+- **M3 (release)**: load testing for capacity; README and examples polished; tag and release v0.1.
 
-## 16. 待实施前确认项
+## 16. Items to confirm before implementation
 
-1. 目标 K8s 版本范围（决定 client-go 版本与 informer API）；
-2. `go.mod` Go 版本与依赖策略（client-go 版本 pinning）；
-3. 是否需要支持多 Service 单 Client（v0.2 再评估 `NewMultiClient`）；
-4. 是否需要在库内提供 Service DNS 回退模式开关（默认不开，文档说明风险）；
-5. 开源协议选择（建议 Apache-2.0）。
+1. Target K8s version range (determines the client-go version and informer API);
+2. Go version in `go.mod` and the dependency strategy (client-go version pinning);
+3. Whether multi-Service single-Client is needed (re-evaluate `NewMultiClient` in v0.2);
+4. Whether to provide a Service DNS fallback mode switch inside the library (default off, document the risk);
+5. Open-source license choice (Apache-2.0 recommended).
 
-## 17. ClusterIP 模式
+## 17. ClusterIP mode
 
-除直接发现并选择 Pod 的 `pod` 模式外，当前实现提供并列的 **`clusterip` 模式**。
-该模式复用单个 `http.Transport` / 连接池，仍然
-访问 Kubernetes Service DNS/ClusterIP，不直接拨 Pod IP；通过低比例随机设置
-`http.Request.Close = true`，让承载本次普通 HTTP 请求的连接在响应完成后退出连接池，促使后续
-新连接由 Kubernetes L4 Service 重新选择 endpoint。
+In addition to the `pod` mode that discovers and selects Pods directly, the current implementation provides a parallel **`clusterip` mode**. This mode reuses a single `http.Transport` / connection pool and still talks to the Kubernetes Service DNS/ClusterIP without dialing Pod IPs directly. It sets `http.Request.Close = true` on a low, random fraction of requests so that the connection carrying that ordinary HTTP request leaves the pool after the response, prompting later new connections to be re-assigned to an endpoint by the Kubernetes L4 Service.
 
-该模式复刻内部网关已验证的连接轮换语义，并与 `pod` 模式保持清晰边界：
+This mode replicates the connection-rotation semantics validated in an internal gateway, and keeps a clear boundary with `pod` mode:
 
-- `pod`：EndpointSlice + 请求级 Picker + 每 Pod 独立 Transport，提供确定性的 Ready Pod 分发；
-- `clusterip`：单一共享 Transport + Service 地址 + 概率性连接轮换，只改善长连接粘连，
-  不承诺请求级精确均衡；
-- 配置使用采样分母表达：`0` 表示关闭，默认 `1000` 表示约 0.1% 请求设置 `req.Close`；非零值
-  最低为 100，避免过高轮换率造成连接风暴；
-- 只对普通、可在有限时间内完成响应的 HTTP 请求采样；带
-  `Accept: text/event-stream` 的 SSE 请求不参与随机关闭；
-- 必须保留用户显式 `req.Close`，并保证不修改调用方原始 Request（clone 后再设置）；
-- 提供 `EventConnectionRotated` Hook 事件，并让 `Client.Mode()` 返回实际模式；
-- API 使用 `ModePod`、`ModeClusterIP`、`WithMode(...)` 和
-  `WithConnectionCloseSampleDenominator(...)`，默认仍为 `pod`，已有行为不变；
-- 未显式配置 `WithPort` 时，只读取 Service 解析 Service port，不启动 EndpointSlice informer；
-  显式配置端口时不需要 Kubernetes API 权限。
+- `pod`: EndpointSlice + request-level Picker + per-Pod dedicated Transport, providing deterministic Ready-Pod distribution;
+- `clusterip`: a single shared Transport + Service address + probabilistic connection rotation, only improving long-connection stickiness and not promising request-level exact balancing;
+- Configured with a sampling denominator: `0` disables rotation, the default `1000` means about 0.1% of requests set `req.Close`; non-zero values must be at least 100 to avoid a connection storm from excessive rotation;
+- Only ordinary HTTP requests that can finish within a finite time are sampled; SSE requests with `Accept: text/event-stream` never participate in random closing;
+- The user's explicit `req.Close` must be preserved, and the caller's original Request must not be modified (clone before setting);
+- Provide an `EventConnectionRotated` hook event and make `Client.Mode()` return the actual mode;
+- The API uses `ModePod`, `ModeClusterIP`, `WithMode(...)`, and `WithConnectionCloseSampleDenominator(...)`; the default remains `pod`, and existing behavior is unchanged;
+- When `WithPort` is not set, only the Service is read to resolve the Service port and no EndpointSlice informer is started; with an explicit port, no Kubernetes API permission is required.
 
-真实集群串行 8000 请求对照结果：`pod` 为 2000/2000/2000/2000；关闭轮换的 `clusterip`
-为 8000/0/0/0；默认 0.1% 轮换采样 10 次后覆盖四个 Pod，但分布为
-5156/1624/830/390。结果验证了精确请求级均衡、L4 keep-alive 粘连和概率轮换三者的差异。
+Real-cluster serial 8000-request comparison: `pod` produced 2000/2000/2000/2000; `clusterip` with rotation off produced 8000/0/0/0; the default 0.1% rotation covered all four Pods after 10 samples but with a distribution of 5156/1624/830/390. This validates the differences among exact request-level balancing, L4 keep-alive stickiness, and probabilistic rotation.
 
-64 并发、每档 5 秒时，共享 Transport 会自然建立多条连接，因此两个模式都覆盖四个 Pod：
-`pod` 四 Pod 差值仅 1；无轮换 `clusterip` 的最大最小差占总请求 0.58%；0.1% 轮换本次为
-1.65%。低概率轮换在高并发短窗口不保证改善瞬时均匀度，其主要价值是让长生命周期连接池持续
-更新，并在扩容后逐步建立映射到新 endpoint 的连接。
+At 64 concurrency with 5 seconds per configuration, the shared Transport naturally opens multiple connections, so both modes cover all four Pods: `pod` differs by only 1 across the four Pods; `clusterip` without rotation has a max-min difference of 0.58% of total requests; with 0.1% rotation this run was 1.65%. Low-probability rotation does not guarantee better instantaneous evenness in short, high-concurrency windows; its main value is to keep long-lived connection pools refreshing and to gradually establish connections to new endpoints after scale-up.
 
-## 18. 参考资料
+## 18. References
 
 - [Kubernetes EndpointSlice API](https://kubernetes.io/docs/reference/kubernetes-api/discovery/endpoint-slice-v1/)
 - [client-go SharedInformerFactory](https://github.com/kubernetes/client-go/blob/master/informers/factory.go)
 - [Go net/http Transport](https://pkg.go.dev/net/http#Transport)
 - [gRPC Custom Name Resolution](https://grpc.io/docs/guides/custom-name-resolution/)
-- [Hertz 服务发现与负载均衡](https://www.cloudwego.io/docs/hertz/tutorials/framework-exten/service_discovery/)
-
+- [Hertz service discovery and load balancing](https://www.cloudwego.io/docs/hertz/tutorials/framework-exten/service_discovery/)

@@ -1,228 +1,230 @@
-# gokubegate 真实集群集成测试实现计划
+> [简体中文](./e2e-integration-test-plan.zh.md)
 
-## 文档状态
+# gokubegate Real-Cluster Integration Test Implementation Plan
 
-- 状态：Plan
-- 日期：2026-08-29
-- 范围：`test/e2e` 真实 Kubernetes 集群集成测试（基于 kind + Docker）
-- 本文是实施计划，对应设计文档 [technical-design.md](./technical-design.md) 的 13.2 集成测试部分
+## Document status
 
-## 1. 背景与目标
+- Status: Plan
+- Date: 2026-08-29
+- Scope: `test/e2e` real-Kubernetes-cluster integration tests (based on kind + Docker)
+- This is an implementation plan; it corresponds to section 13.2 (integration testing) of the design document [technical-design.md](./technical-design.md)
 
-单元测试用 fake clientset 验证了 informer/聚合/Picker 等内部逻辑，但无法覆盖：
+## 1. Background and goals
 
-- 真实 kube-apiserver + controller-manager 产生的 EndpointSlice（controller 语义、条件字段、删除时序）；
-- 真实 Pod 网络、Service/endpoint 扩缩容、readiness 变化；
-- 集群内运行时的 in-cluster config、ServiceAccount、RBAC 真实行为。
+Unit tests use a fake clientset to verify internal logic such as the informer/aggregation/Picker, but they cannot cover:
 
-本计划用 **kind**（Kubernetes in Docker）在 Docker 内启动一个真实 K8s 集群，把测试组件（下游服务、压测客户端）全部容器化，测试结束整体删除集群，**不污染宿主机环境**（不修改现有集群配置、不占用宿主机端口、不留运行中的服务）。
+- EndpointSlices produced by a real kube-apiserver + controller-manager (controller semantics, condition fields, deletion timing);
+- Real Pod networking, Service/endpoint scaling, and readiness changes;
+- Real in-cluster config, ServiceAccount, and RBAC behavior at runtime.
 
-### 验收目标（场景总览）
+This plan uses **kind** (Kubernetes in Docker) to start a real K8s cluster inside Docker, containerizes all test components (downstream service, load client), and deletes the whole cluster when the test finishes, **without polluting the host environment** (no changes to existing cluster config, no host ports, no lingering services).
 
-| 编号 | 场景 | 一句话验收标准 |
+### Acceptance targets (scenario overview)
+
+| ID | Scenario | One-line acceptance criterion |
 | --- | --- | --- |
-| S1 | 基础负载均衡 | 2 副本下游，500 请求按请求级分发，各 Pod 命中在容差内 |
-| S2 | Host/路径保真 | 下游收到的 Host 为逻辑 Service 域名，path/query 原样 |
-| S3 | 扩容 | 2→4 副本，新 Pod Ready 后开始收到流量 |
-| S4 | 缩容 / NotReady | 摘除/NotReady 的 Pod 不再收到新请求 |
-| S5 | RBAC | 最小权限可运行；缺权限时 `NewClient` 启动即失败 |
-| S6 | SSE 长连接（可选） | 流建立后固定在一个 Pod，新流继续均衡 |
-| S7 | API Server 抖动（可选） | informer 断连期间继续用 last-known-good 转发 |
+| S1 | Basic load balancing | 2-replica downstream, 500 requests distributed per-request, per-Pod hits within tolerance |
+| S2 | Host/path fidelity | downstream receives the logical Service domain as Host; path/query preserved verbatim |
+| S3 | Scale-up | 2→4 replicas; new Pods start receiving traffic after Ready |
+| S4 | Scale-down / NotReady | removed/NotReady Pods stop receiving new requests |
+| S5 | RBAC | minimal permissions work; missing permissions fail `NewClient` at startup |
+| S6 | SSE long connections (optional) | a stream stays on one Pod; new streams keep balancing |
+| S7 | API server disruption (optional) | last-known-good forwarding continues while the informer is disconnected |
 
-## 2. 非目标（本期不做）
+## 2. Non-goals (not this phase)
 
-- 性能/容量压测（单独 benchmark，见设计文档 13.3）；
-- 服务网格（Istio/Linkerd）下的 mTLS/sidecar 路径验证；
-- 多集群、跨地域；
-- HTTP/2 验证（v0.1 未启用）；
-- Windows/macOS 之外的平台适配（本机为 Linux；Docker Desktop 可运行 kind）。
+- Performance/capacity load testing (separate benchmark; see design document 13.3);
+- mTLS/sidecar path verification under a service mesh (Istio/Linkerd);
+- Multi-cluster, cross-region;
+- HTTP/2 verification (not enabled in v0.1);
+- Platforms other than Windows/macOS (the host is Linux; Docker Desktop can run kind).
 
-## 3. 技术选型
+## 3. Technology choices
 
-### 3.1 为什么用 kind
+### 3.1 Why kind
 
-- **真实集群**：kind 启动的是真实 kube-apiserver、kube-controller-manager、kubelet、CNI（kindnet），EndpointSlice 由真实 controller 生成，语义与生产一致；
-- **全容器化**：控制面与节点都是 Docker 容器，`kind delete cluster` 可整体清理；
-- **官方维护**：kubernetes-sigs 出品，CI 友好，有官方 GitHub Action；
-- **镜像可预加载**：`kind load docker-image` 直接加载本地构建镜像，无需 registry。
+- **Real cluster**: kind starts a real kube-apiserver, kube-controller-manager, kubelet, and CNI (kindnet); EndpointSlices are produced by the real controller, with production-equivalent semantics;
+- **Fully containerized**: control plane and nodes are Docker containers; `kind delete cluster` cleans everything up;
+- **Officially maintained**: produced by kubernetes-sigs, CI-friendly, with an official GitHub Action;
+- **Preloadable images**: `kind load docker-image` loads locally built images directly, no registry needed.
 
-备选：k3d（k3s in Docker）更轻更快，但 k3s 使用自带 Service 代理与精简组件，EndpointSlice/readiness 行为与标准 K8s 有差异；作为备选记录，默认用 kind。
+Alternative: k3d (k3s in Docker) is lighter and faster, but k3s uses its own Service proxy and trimmed components, so EndpointSlice/readiness behavior differs from standard K8s. Recorded as an alternative; kind is the default.
 
-### 3.2 为什么不用 envtest
+### 3.2 Why not envtest
 
-envtest 只启动 kube-apiserver + etcd 二进制，没有 kubelet/节点/Pod/网络，无法验证真实 Pod 与 EndpointSlice 生命周期，不满足"真实集群"要求。
+envtest only starts kube-apiserver + etcd binaries, with no kubelet/nodes/Pods/network, so it cannot verify real Pod and EndpointSlice lifecycles and does not satisfy the "real cluster" requirement.
 
-### 3.3 Docker 隔离策略
+### 3.3 Docker isolation strategy
 
-- kind 集群：全部组件运行在 Docker 容器内，不占宿主机端口（kind 自动分配），不动宿主机 kubeconfig（测试用临时 kubeconfig，放在 `.cache/e2e/`）；
-- 测试镜像：`downstream`、`tester` 两个镜像本地构建 + `kind load`，无需推送 registry；
-- 清理：`t.Cleanup` / `make e2e-clean` 保证删除 namespace、Job、Deployment；`kind delete cluster` 删除集群；`GOKUBEGATE_E2E_KEEP=1` 保留集群便于调试；
-- 全隔离模式（可选增强）：`make e2e-dind` 在 Docker 容器内（挂载 docker.sock）运行整套测试，宿主机只需 Docker，连 kind/kubectl/go 都不需要安装。
+- kind cluster: all components run in Docker containers, no host ports (kind allocates them), no host kubeconfig changes (test kubeconfig lives under `.cache/e2e/`);
+- Test images: `downstream` and `tester` are built locally + `kind load`, no registry push needed;
+- Cleanup: `t.Cleanup` / `make e2e-clean` remove the namespace, Job, and Deployment; `kind delete cluster` removes the cluster; `GOKUBEGATE_E2E_KEEP=1` keeps the cluster for debugging;
+- Full-isolation mode (optional enhancement): `make e2e-dind` runs the whole suite inside a Docker container (mounting docker.sock), so the host only needs Docker — not even kind/kubectl/go.
 
-### 3.4 镜像构建
+### 3.4 Image builds
 
-- `downstream`：multi-stage，`golang:1.26` 构建 → `alpine`/`distroless` 运行；
-- `tester`：同样 multi-stage，import `github.com/zzxn/gokubegate`，作为 Job 运行；
-- 构建缓存：利用 `docker build` 层缓存；镜像 tag 用短 commit sha，避免陈旧。
+- `downstream`: multi-stage, built with `golang:1.26`, run on `alpine`/`distroless`;
+- `tester`: also multi-stage, imports `github.com/zzxn/gokubegate`, runs as a Job;
+- Build cache: leverage `docker build` layer caching; image tags use short commit SHAs to avoid staleness.
 
-## 4. 环境要求
+## 4. Environment requirements
 
-| 依赖 | 版本/说明 | 本机现状 |
+| Dependency | Version/notes | Current host |
 | --- | --- | --- |
 | Docker | >= 24 | ✅ 29.1.2 (Docker Desktop) |
-| kind CLI | v0.2x（计划固定一个版本） | ❌ 未安装 → 引导脚本自动下载到 `.cache/kind/` |
-| kubectl | 可选（driver 用 client-go 也行） | ✅ 已有 |
-| Go | 1.26+（driver 与镜像构建用） | ✅ 1.26.1 |
-| 内存 | kind 单集群建议 >= 4GB | ✅ 30GB |
+| kind CLI | v0.2x (a version will be pinned) | ❌ not installed → bootstrap script downloads to `.cache/kind/` |
+| kubectl | optional (the driver can use client-go) | ✅ present |
+| Go | 1.26+ (driver and image builds) | ✅ 1.26.1 |
+| Memory | kind single cluster suggests >= 4GB | ✅ 30GB |
 
-引导脚本 `scripts/e2e-bootstrap.sh`：
+Bootstrap script `scripts/e2e-bootstrap.sh`:
 
 ```bash
-# 下载 kind 到 .cache/kind/（不装进系统），并校验 sha256
+# download kind to .cache/kind/ (not into the system), verify sha256
 KIND_VERSION=${KIND_VERSION:-v0.27.0}
 curl -Lo .cache/kind/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
 chmod +x .cache/kind/kind
 ```
 
-## 5. 目录结构与组件
+## 5. Directory structure and components
 
 ```text
 test/e2e/
-  driver_test.go        // 主入口：//go:build e2e 门控；kind 生命周期 + 场景编排 + 断言
+  driver_test.go        // main entry: //go:build e2e gate; kind lifecycle + scenario orchestration + assertions
   harness/
-    kind.go             // 创建/删除/复用 kind 集群、获取临时 kubeconfig
-    kube.go             // client-go 封装：apply manifests、wait Ready、scale、读日志
-    wait.go             // 轮询等待（超时可配）
+    kind.go             // create/delete/reuse kind cluster, fetch temporary kubeconfig
+    kube.go             // client-go wrappers: apply manifests, wait Ready, scale, read logs
+    wait.go             // polling wait (configurable timeout)
   downstream/
-    main.go             // 下游 HTTP 服务：返回 Pod 名/IP；/ready 可切换 readiness；/stats 计数
+    main.go             // downstream HTTP service: returns Pod name/IP; /ready toggles readiness; /stats counts
     Dockerfile
   tester/
-    main.go             // 使用 gokubegate 的压测 CLI：跑 N 请求，输出 JSON 结果
+    main.go             // load CLI using gokubegate: sends N requests, outputs JSON results
     Dockerfile
   manifests/
     namespace.yaml      // gokubegate-e2e
     rbac.yaml           // ServiceAccount + Role(endpointslices rw + services get) + RoleBinding
-    rbac-denied.yaml    // 只有错误 Role 的副本（S5 用）
-    downstream.yaml     // Deployment(副本数可覆盖) + Service + readinessProbe
-    tester.yaml         // Job 模板（命令参数化：请求数/目标 URL/输出）
-  README.md             // 如何运行、常见问题
+    rbac-denied.yaml    // a copy with only the wrong Role (for S5)
+    downstream.yaml     // Deployment(replica count overridable) + Service + readinessProbe
+    tester.yaml         // Job template (parameterized command: request count / target URL / output)
+  README.md             // how to run, FAQ
 Makefile                // make e2e / e2e-e2e-down / e2e-clean / e2e-dind
 scripts/
-  e2e-bootstrap.sh      // 下载 kind 到 .cache
-  e2e-dind.sh           // 可选：全隔离 DinD 入口
+  e2e-bootstrap.sh      // download kind to .cache
+  e2e-dind.sh           // optional: full-isolation DinD entrypoint
 ```
 
-### 5.1 downstream（下游被测服务）
+### 5.1 downstream (service under test)
 
-- 监听 8080（与 Service/EndpointSlice 端口一致）；
-- `GET /`：返回 `{pod, node, ip, host}`（`pod` 从 `POD_NAME` env / 自身 hostname 读取）；
-- `GET /ready`：返回 readiness 状态（可被 `/admin/ready?on=false` 切换，供 S4 模拟 NotReady）；
-- `GET /stats`：返回本 Pod 收到的请求数（内存计数，含 `x-gokubegate-count` 之类可关闭的日志）。
+- Listens on 8080 (matching the Service/EndpointSlice port);
+- `GET /`: returns `{pod, node, ip, host}` (`pod` read from the `POD_NAME` env / its own hostname);
+- `GET /ready`: returns the readiness state (can be toggled via `/admin/ready?on=false` for S4 NotReady simulation);
+- `GET /stats`: returns the request count received by this Pod (in-memory counter, plus optional logging like `x-gokubegate-count`).
 
-### 5.2 tester（压测客户端）
+### 5.2 tester (load client)
 
-- 用 `gokubegate.NewClient(ctx, ns, svc, WithHook(...))` 创建 client；
-- 按参数执行 `N` 个请求，Hook 记录 `endpoint_picked` / `request_done` 分布与 reuse；
-- 输出 JSON 到 stdout：
+- Creates a client with `gokubegate.NewClient(ctx, ns, svc, WithHook(...))`;
+- Runs `N` requests per parameters; hooks record `endpoint_picked` / `request_done` distribution and reuse;
+- Outputs JSON to stdout:
   ```json
   {"phase":"baseline","requests":500,"byEndpoint":{"pod-xxx":251,"pod-yyy":249},"reusedRatio":0.98,"hostEcho":"svc.ns.svc.cluster.local:8080","errors":0}
   ```
-- 退出码：自身错误非 0；**不**做业务断言（断言由 host driver 做）。
+- Exit code: non-zero only for its own errors; it does **not** make business assertions (assertions are made by the host driver).
 
-## 6. 测试场景与执行流程
+## 6. Test scenarios and execution flow
 
-driver 的全局流程（每个场景独立或串联，见下）：
+Global driver flow (each scenario is independent or chained, see below):
 
-1. `TestMain` / suite setup：
-   - 若 `GOKUBEGATE_E2E_CLUSTER` 指定已存在集群则复用（节省时间）；否则 `kind create cluster`（`--name gokubegate-e2e`，配置 1 control-plane + 1 worker，内存 2GB/节点）；
-   - 构建 `downstream`/`tester` 镜像并 `kind load`；
-   - 应用 namespace/RBAC/manifests，等待 downstream Deployment ready；
-2. 逐场景执行；
-3. `t.Cleanup`：删除 Job/Deployment/namespace；`GOKUBEGATE_E2E_KEEP=1` 保留集群，否则 `kind delete cluster`。
+1. `TestMain` / suite setup:
+   - If `GOKUBEGATE_E2E_CLUSTER` names an existing cluster, reuse it (saves time); otherwise `kind create cluster` (`--name gokubegate-e2e`, 1 control-plane + 1 worker, 2GB/node);
+   - Build the `downstream`/`tester` images and `kind load` them;
+   - Apply namespace/RBAC/manifests, wait for the downstream Deployment to be ready;
+2. Execute each scenario;
+3. `t.Cleanup`: delete the Job/Deployment/namespace; `GOKUBEGATE_E2E_KEEP=1` keeps the cluster, otherwise `kind delete cluster`.
 
-### S1 基础负载均衡
+### S1 Basic load balancing
 
-- 前置：downstream 2 副本 Ready；
-- 执行：跑 tester Job（500 请求，目标 `http://downstream.gokubegate-e2e.svc.cluster.local:8080/`）；
-- 断言（host driver 读取 Job 日志 JSON + 各 Pod `/stats`）：
-  - 请求全部成功（errors=0）；
-  - 两个 Pod 命中数均在 `[40%, 60%]` 区间（n=500 的经验容差，可配置）；
-  - `reusedRatio >= 0.9`（说明连接池生效，不是每次新建连接）；
-- 判定标准：以各下游 Pod 的 `/stats` 为权威计数；tester 侧 Hook 分布作交叉验证，允许两者因"请求已在途/连接关闭"存在小偏差。
+- Precondition: downstream 2 replicas Ready;
+- Execute: run the tester Job (500 requests, target `http://downstream.gokubegate-e2e.svc.cluster.local:8080/`);
+- Assert (host driver reads the Job log JSON + each Pod's `/stats`):
+  - All requests succeed (errors=0);
+  - Both Pods' hit counts are within `[40%, 60%]` (empirical tolerance for n=500, configurable);
+  - `reusedRatio >= 0.9` (the connection pool is working, not reconnecting every time);
+- Judgment: each downstream Pod's `/stats` is authoritative; the tester-side hook distribution is cross-validation, allowing small deviations due to "request already in flight / connection closed".
 
-### S2 Host/路径保真
+### S2 Host/path fidelity
 
-- 前置：同 S1；
-- 执行：tester 请求带自定义 path/query，如 `/api/items?page=1`；downstream 回显 `r.Host` 与 `r.URL`；
-- 断言：tester 输出的 `hostEcho == "downstream.gokubegate-e2e.svc.cluster.local:8080"`，且 path/query 原样；另跑一个设置 `req.Host=custom.example.com` 的请求，断言 Host 被尊重（设计文档 8.1）。
+- Precondition: same as S1;
+- Execute: tester requests carry a custom path/query, e.g. `/api/items?page=1`; downstream echoes `r.Host` and `r.URL`;
+- Assert: tester outputs `hostEcho == "downstream.gokubegate-e2e.svc.cluster.local:8080"`, with path/query preserved verbatim; also run one request with `req.Host=custom.example.com` and assert the Host is respected (design document 8.1).
 
-### S3 扩容
+### S3 Scale-up
 
-- 前置：S1 后；downstream 2 副本；
-- 步骤：
-  1. `kubectl scale deployment downstream --replicas=4`；
-  2. 等待 4 个 Pod Ready（`rollout status` / 轮询 EndpointSlice ready 数 == 4）；
-  3. 跑 tester Job（500 请求）；
-- 断言：4 个 Pod 都收到流量（各 >= 5%，即新 Pod 确实接流）；总请求全部成功。
+- Precondition: after S1; downstream 2 replicas;
+- Steps:
+  1. `kubectl scale deployment downstream --replicas=4`;
+  2. Wait for 4 Pods Ready (`rollout status` / poll EndpointSlice ready count == 4);
+  3. Run the tester Job (500 requests);
+- Assert: all 4 Pods receive traffic (each >= 5%, i.e., new Pods indeed receive traffic); all requests succeed.
 
-### S4 缩容 / NotReady
+### S4 Scale-down / NotReady
 
-- 前置：4 副本 Ready；
-- 场景 A（缩容）：`scale --replicas=2`；等待 Ready == 2；跑 tester；断言：被摘除 Pod 的 `/stats` 不再增长（对比摘除前的计数），存活 Pod 收到全部流量；
-- 场景 B（NotReady）：对某个 Pod 调 `/admin/ready?on=false`，等待其 readiness probe 失败、EndpointSlice ready 数 == 3；跑 tester；断言该 Pod 不再收到新请求；随后恢复 ready，断言重新接流；
-- 时序说明：摘除/NotReady 后给 2~5s 过渡窗口（EndpointSlice 传播 + informer reconcile），再开始压测。
+- Precondition: 4 replicas Ready;
+- Scenario A (scale-down): `scale --replicas=2`; wait Ready == 2; run tester; assert: removed Pods' `/stats` no longer grow (compare against pre-removal counts), surviving Pods receive all traffic;
+- Scenario B (NotReady): call `/admin/ready?on=false` on a Pod, wait for its readiness probe to fail and EndpointSlice ready count == 3; run tester; assert that Pod no longer receives new requests; then restore ready and assert it resumes receiving traffic;
+- Timing note: after removal/NotReady, allow a 2–5s transition window (EndpointSlice propagation + informer reconcile) before starting the load.
 
 ### S5 RBAC
 
-- 场景 A（最小权限）：默认 tester 用 `rbac.yaml`（endpointslices rw + services get）运行，S1 通过即证明最小权限足够；
-- 场景 B（缺权限 fail-fast）：用 `rbac-denied.yaml`（无 endpointslices 权限）跑 tester；断言 tester 启动阶段 `NewClient` 返回错误（日志含 RBAC/list/watch 拒绝），Job 失败退出——对应设计文档 10.1"启动失败 fail fast"。
+- Scenario A (minimal permissions): the default tester runs with `rbac.yaml` (endpointslices rw + services get); S1 passing proves minimal permissions are sufficient;
+- Scenario B (missing permissions, fail-fast): run the tester with `rbac-denied.yaml` (no endpointslices permission); assert that `NewClient` returns an error during startup (log contains RBAC/list/watch rejection) and the Job exits as failed — corresponding to design document 10.1 "startup failure fail fast".
 
-### S6 SSE 长连接（可选，P3）
+### S6 SSE long connections (optional, P3)
 
-- downstream 增加 `GET /stream`：每 500ms 发一条 SSE event，持续 10s，事件内容含自身 Pod 名；
-- tester 用 `http.Client{Transport: gate, Timeout: 0}` 建立 1 条流，记录收到的全部事件 Pod 名；
-- 断言：一条流内 Pod 名恒定；随后并发 20 条新流，断言 4 个 Pod 都至少被选中 1 次。
+- downstream adds `GET /stream`: emits one SSE event every 500ms for 10s, event content includes its own Pod name;
+- tester uses `http.Client{Transport: gate, Timeout: 0}` to open 1 stream and record all received event Pod names;
+- Assert: the Pod name is constant within one stream; then open 20 concurrent new streams and assert all 4 Pods are selected at least once.
 
-### S7 API Server 抖动（可选/高级）
+### S7 API server disruption (optional/advanced)
 
-- 思路：`docker pause` 控制面容器 20~30s，期间 informer watch 断开，但 tester 继续请求应全部成功（last-known-good 快照）；
-- 注意：pause 整个 control-plane 会影响 kubelet/调度，Pod 可能受影响，结果解读需谨慎；如不稳定则降级为"只验证 watch 断连后恢复"，或推迟到 M3 用更可控的方式（如临时改 informer 端点的网络策略）模拟；
-- 标记为实验性，不阻塞 P1/P2。
+- Idea: `docker pause` the control-plane container for 20–30s; during this the informer watch disconnects, but tester requests should all succeed (last-known-good snapshot);
+- Note: pausing the whole control plane affects kubelet/scheduling, so Pods may be affected and results must be interpreted carefully; if unstable, downgrade to "only verify recovery after watch disconnection", or defer to M3 with a more controllable simulation (e.g., temporarily change the informer endpoint's network policy);
+- Marked experimental, does not block P1/P2.
 
-## 7. 数据采集与断言设计
+## 7. Data collection and assertion design
 
-- **权威计数**：下游各 Pod `/stats`（内存计数）。driver 在压测前后各采集一次，做差值；
-- **tester 侧**：Hook 事件统计（picked/request_done/reused），输出 JSON；
-- **断言时点**：Job 完成后统一断言（避免边跑边查的时序问题）；阶段切换用 `wait` 工具轮询（默认超时 60s，间隔 500ms）；
-- **容差参数**：集中定义在 harness 常量中（`distributionTolerance = 0.20` 等），便于调整；
-- **日志**：tester Job 日志 `kubectl logs` 完整拉取，失败时打印上下文便于排查。
+- **Authoritative count**: each downstream Pod's `/stats` (in-memory counter). The driver samples before and after each load run and takes the difference;
+- **Tester side**: hook event statistics (picked/request_done/reused), output as JSON;
+- **Assertion timing**: assert uniformly after the Job completes (avoid mid-run timing issues); phase transitions use the `wait` polling utility (default timeout 60s, interval 500ms);
+- **Tolerance parameters**: centralized as harness constants (`distributionTolerance = 0.20`, etc.) for easy tuning;
+- **Logs**: tester Job logs are fully pulled via `kubectl logs`; on failure, context is printed for debugging.
 
-## 8. 运行方式与 CI
+## 8. How to run and CI
 
-### 8.1 本地运行
+### 8.1 Local run
 
 ```bash
-# 首次：下载 kind 到 .cache
+# first time: download kind to .cache
 make e2e-bootstrap
 
-# 跑全部 e2e（创建 kind → 测试 → 删除）
+# run the full e2e (create kind → test → delete)
 make e2e
 
-# 保留集群调试
+# keep the cluster for debugging
 GOKUBEGATE_E2E_KEEP=1 make e2e
 
-# 只跑指定场景（通过 go test -run）
+# run a specific scenario (via go test -run)
 make e2e ARGS="-run TestE2EScaleUp"
 
-# 清理
+# cleanup
 make e2e-clean
 ```
 
-门控：`driver_test.go` 使用 `//go:build e2e` 构建标签，默认 `go test ./...` **不会**执行 e2e；显式 `go test -tags e2e ./test/e2e/...` 才运行。CI 中通过环境变量 `GOKUBEGATE_E2E=1` 双重保护。
+Gating: `driver_test.go` uses the `//go:build e2e` build tag, so a plain `go test ./...` does **not** run e2e; only `go test -tags e2e ./test/e2e/...` does. In CI, the `GOKUBEGATE_E2E=1` environment variable provides double protection.
 
-### 8.2 全隔离模式（可选增强）
+### 8.2 Full-isolation mode (optional enhancement)
 
-`make e2e-dind`：在 Docker 容器内（`--privileged` + 挂载 docker.sock）运行引导脚本 + e2e，宿主机只需 Docker：
+`make e2e-dind`: run the bootstrap script + e2e inside a Docker container (`--privileged` + docker.sock mount); the host only needs Docker:
 
 ```bash
 docker run --rm --privileged \
@@ -231,38 +233,38 @@ docker run --rm --privileged \
   golang:1.26 bash -c "make e2e-bootstrap && make e2e"
 ```
 
-### 8.3 CI（后续接入）
+### 8.3 CI (to be wired later)
 
-GitHub Actions 使用官方 `kind` action（`kindest/node` 固定版本），steps：setup-go → checkout → `go build ./...` → `make e2e`。CI 镜像拉取可配置 `GOPROXY` 与 kind 镜像镜像源。
+GitHub Actions uses the official `kind` action (`kindest/node` pinned version). Steps: setup-go → checkout → `go build ./...` → `make e2e`. CI image pulls can configure `GOPROXY` and a kind image mirror.
 
-## 9. 风险与对策
+## 9. Risks and mitigations
 
-| 风险 | 影响 | 对策 |
+| Risk | Impact | Mitigation |
 | --- | --- | --- |
-| kind 未安装 / 下载失败 | 无法开始 | 引导脚本 + 固定版本 + sha256 校验；失败给出明确提示 |
-| 镜像拉取慢（goproxy.cn 或 kind 基础镜像） | 超时 | 设 `GOPROXY=https://goproxy.cn,direct`；kind 镜像版本固定并预热 |
-| 时序不稳定（EndpointSlice 传播、probe 周期） | 断言误报 | 统一 `wait` 轮询 + 过渡窗口；容差可配；失败重试一次 |
-| Docker Desktop 资源限制 | 集群起不来 | 单节点配置（1 control-plane + 1 worker）；文档写明最低 4GB |
-| 与本地已有集群/kubectl 冲突 | 污染环境 | 全部隔离在 kind 与 `.cache/e2e/`；不写宿主 kubeconfig 默认位置 |
-| 场景偶发 flaky | CI 卡顿 | 每个场景独立可 rerun；先跑 P1 场景再扩展 |
+| kind not installed / download failure | cannot start | bootstrap script + pinned version + sha256 check; clear error on failure |
+| Slow image pulls (goproxy.cn or kind base image) | timeout | set `GOPROXY=https://goproxy.cn,direct`; pin and pre-warm the kind image version |
+| Timing instability (EndpointSlice propagation, probe period) | flaky assertions | uniform `wait` polling + transition window; configurable tolerance; one retry on failure |
+| Docker Desktop resource limits | cluster won't start | single-node config (1 control-plane + 1 worker); document min 4GB |
+| Conflict with existing local cluster/kubectl | environment pollution | everything isolated in kind and `.cache/e2e/`; don't write the default host kubeconfig location |
+| Occasional flaky scenarios | CI stalls | each scenario independently re-runnable; run P1 first, then extend |
 
-## 10. 里程碑
+## 10. Milestones
 
-- **P1（骨架 + 基础场景）**：harness（kind/kube/wait）、downstream、tester、Makefile、S1/S2 跑通；
-- **P2（生命周期场景）**：S3 扩容、S4 缩容/NotReady、S5 RBAC（含 fail-fast 验证）；
-- **P3（可选 + CI）**：S6 SSE、S7 API Server 抖动（实验性）、GitHub Actions 接入、README 完善。
+- **P1 (skeleton + basic scenarios)**: harness (kind/kube/wait), downstream, tester, Makefile, S1/S2 passing;
+- **P2 (lifecycle scenarios)**: S3 scale-up, S4 scale-down/NotReady, S5 RBAC (including fail-fast verification);
+- **P3 (optional + CI)**: S6 SSE, S7 API server disruption (experimental), GitHub Actions integration, README polish.
 
-## 11. 待实施前确认项
+## 11. Items to confirm before implementation
 
-1. kind 固定版本（建议 v0.27.x）+ 对应 `kindest/node` 镜像 tag；
-2. 测试命名空间命名（建议 `gokubegate-e2e`）；
-3. 是否接受引导脚本往 `.cache/` 下载 kind（不装系统路径）；
-4. e2e 是否纳入常规 CI（当前计划先本地跑，CI 后接）；
-5. S7 的模拟方式（pause control-plane vs 其他），若不稳定是否降级为仅"断连恢复"验证。
+1. kind pinned version (suggest v0.27.x) + matching `kindest/node` image tag;
+2. Test namespace name (suggest `gokubegate-e2e`);
+3. Whether to accept the bootstrap script downloading kind into `.cache/` (not a system path);
+4. Whether e2e joins regular CI (currently local-first, CI later);
+5. How to simulate S7 (pause control-plane vs other), and whether to downgrade to "disconnect-and-recover only" if unstable.
 
-## 12. 参考资料
+## 12. References
 
 - [kind (Kubernetes in Docker)](https://kind.sigs.k8s.io/)
-- [kind 官方 GitHub Action](https://github.com/marketplace/actions/kind-kubernetes-in-docker-action)
-- [Kubernetes EndpointSlice 概念](https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/)
-- gokubegate 设计文档：`docs/spec/technical-design.md`（13.2 集成测试、9 生命周期、10 失败处理）
+- [kind official GitHub Action](https://github.com/marketplace/actions/kind-kubernetes-in-docker-action)
+- [Kubernetes EndpointSlice concept](https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/)
+- gokubegate design document: `docs/spec/technical-design.md` (13.2 integration tests, 9 lifecycle, 10 failure handling)
