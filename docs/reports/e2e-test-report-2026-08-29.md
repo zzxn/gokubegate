@@ -211,35 +211,41 @@ tester、下游 Pod、kind/Docker 共享宿主资源的综合影响，不能直�
 网络竞态；当前设计明确不做跨 Pod 自动重试，以避免不可安全重放请求产生重复写入。错误只出现
 在一个秒级窗口，随后恢复为零。
 
-### 发布替换：10 旧 Pod → 10 新 Pod → 旧 Pod 全部下线（pod 模式）
+### 发布替换：10 旧 Pod → 10 新 Pod → 旧 Pod 全部下线（pod 与 clusterip 对比）
 
-模拟零宕机滚动发布（`TestE2ERolloutReplacement`）：10 个 Pod 持续运行，触发 Deployment
-滚动更新（新 ReplicaSet 模板标签 `rollout=v2`，strategy `maxSurge=100%` /
-`maxUnavailable=0`，即 10 个新 Pod 全部 Ready 后旧 10 个才下线）；全程 128 并发持续
-负载 120 秒。
+模拟零宕机滚动发布（`TestE2ERolloutReplacement` / `TestE2ERolloutReplacementClusterIP`）：
+10 个 Pod 持续运行，触发 Deployment 滚动更新（新 ReplicaSet 唯一模板标签，strategy
+`maxSurge=100%` / `maxUnavailable=0`，即 10 个新 Pod 全部 Ready 后旧 10 个才下线）；
+全程 128 并发持续负载 120 秒，同集群依次跑两种模式。
 
-| 指标 | 结果 |
-| --- | --- |
-| 请求 / 成功 / 错误 | 13,153,315 / 13,151,165 / 2,150 |
-| 总错误率 | 0.0163% |
-| 吞吐 | 109,591.5 req/s（20 Pod 过渡期） |
-| p50 / p95 / p99 | 0.60 / 3.76 / 6.92 ms |
-| 最大延迟 | 105.47 ms |
-| 连接复用率 | 98.8% |
-| 新 Pod 首次接流量 | 第 7–8 秒（Ready 后当秒接入） |
-| 完整秒级中断 | 0 |
+| 指标 | pod | clusterip |
+| --- | ---: | ---: |
+| 请求 / 成功 / 错误 | 10,755,864 / 10,755,463 / 401 | 477,260 / 477,156 / 104 |
+| 总错误率 | 0.0037% | 0.0218% |
+| 吞吐 | 89,627.0 req/s | 3,975.5 req/s |
+| p50 / p95 / p99 | 0.76 / 4.58 / 8.41 ms | 2.07 / 59.79 / 768.57 ms |
+| 最大延迟 | 131.56 ms | 8,474.13 ms |
+| 连接复用率 | 99.1% | 99.96% |
+| 轮换次数 | 0 | 522 |
+| 新 Pod 首次接流量 | 第 8 秒（Ready 后当秒） | 第 9–17 秒 |
+| 完整秒级中断 | 0 | 0 |
 
 结论：
 
-- **错误率很低**：2,150 次全部是旧 Pod 下线窗口内拨到已终止 Pod 的 `connection
-  refused`（2,116）与 `connection reset`（34），占比 0.0163%，与快速缩容场景同量级；
-  逐秒窗口无零成功秒，**无完整秒级中断**。
-- **新 Pod 快速获取流量**：新 ReplicaSet Ready 后当秒（第 7–8 秒）即进入轮询；过渡期
-  20 个 Pod 全部收到流量，之后新 Pod 占绝大多数（旧 Pod 只覆盖发布初期约 7 秒）。
-- **无抖动**：全程 p99 6.92ms、复用率 98.8%、吞吐 109.6k req/s。
-- 说明：`maxUnavailable=0` 保证旧 Pod 在新 Pod Ready 后才下线，错误窗口只剩「单 Pod
-  终止 → EndpointSlice/快照收敛」的秒级竞态；若要进一步接近零，可在上层对幂等请求加
-  可选重试（库内不默认重试）。
+- **pod 模式满足发布场景全部预期**：错误率 0.0037%（全部是旧 Pod 下线窗口拨到已终止
+  Pod 的 refused/reset）、新 Pod Ready 后当秒接入（第 8 秒）、p99 8.41ms、吞吐
+  89.6k req/s、无完整秒级中断。
+- **clusterip 模式不满足发布场景预期**：
+  - 吞吐塌陷到 3,975 req/s（pod 的 1/22）——新 Pod 上线/旧 Pod 下线期间 kube-proxy
+    endpoint 持续变化，ClusterIP 新连接不断被导到下线中 Pod，连接池处于持续重建状态；
+  - 抖动严重：p99 768.57ms、最大 8.47s（pod 模式 p99 8.4ms / 最大 132ms）；
+  - 新 Pod 第 9–17 秒才陆续接入（pod 模式第 8 秒当秒接入）；
+  - 错误率 0.0218%（仍属低位，但为 pod 模式的 6 倍）。
+- **发布/滚动场景必须使用 pod 模式**；clusterip 仅适合低并发、endpoint 稳定、无发布
+  窗口的场景。
+- 说明：`maxUnavailable=0` 保证旧 Pod 在新 Pod Ready 后才下线，pod 模式错误窗口只剩
+  「单 Pod 终止 → EndpointSlice/快照收敛」的秒级竞态；若要进一步接近零，可在上层对
+  幂等请求加可选重试（库内不默认重试）。
 
 ### clusterip 模式快速扩缩容（与 pod 模式同场对比）
 
@@ -455,8 +461,9 @@ Job 调度或 Deployment/EndpointSlice 收敛时间，也没有覆盖并发请�
 - pod/clusterip 双模式快速扩缩容 e2e（本报告 §3 补测，各 24 秒 64 并发负载）：通过。
 - `TestE2EModeBenchmark` 全量对比（11 配置饱和 + 11 配置限速验收 + 5 配置收敛，共 27
   子用例，570.76 秒，下游固定 1c1g，pod idle 扫描 8/16/32/64/128/512）：通过。
-- `TestE2ERolloutReplacement` 发布替换 e2e（10 旧 → 10 新 → 旧下线，13.15M 请求，
-  136.19 秒）：通过。
+- `TestE2ERolloutReplacement` / `TestE2ERolloutReplacementClusterIP` 发布替换 e2e
+  （10 旧 → 10 新 → 旧下线）：pod 通过（0.0037% 错误、p99 8.4ms）；clusterip 通过
+  宽松验收但吞吐 3,975 req/s、p99 769ms，不满足发布场景预期。
 - `go test -race ./...`：通过。
 - `git diff --check`：通过。
 - 临时 kind 集群：已清理。

@@ -851,23 +851,34 @@ func TestE2EModeBenchmark(t *testing.T) {
 // (maxSurge=100%, maxUnavailable=0). Sustained load must keep flowing with a
 // low error rate and no full-second outage while the new Pods receive traffic.
 func TestE2ERolloutReplacement(t *testing.T) {
+	testRolloutReplacement(t, "pod")
+}
+
+// TestE2ERolloutReplacementClusterIP runs the same rollout replacement through
+// the shared Service transport with the default 1/1000 rotation.
+func TestE2ERolloutReplacementClusterIP(t *testing.T) {
+	testRolloutReplacement(t, "clusterip")
+}
+
+func testRolloutReplacement(t *testing.T, mode string) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 	oldPods := ensureDownstream(t, ctx, 10)
 	defer ensureDownstream(t, ctx, 2)
 
-	const (
-		jobName     = "tester-rollout"
-		concurrency = 128
-		loadTime    = 120 * time.Second
-	)
+	const concurrency = 128
+	const loadTime = 120 * time.Second
+	jobName := "tester-rollout-" + mode
 	args := []string{
-		"-phase", "rollout",
+		"-phase", "rollout-" + mode,
 		"-namespace", h.opts.Namespace,
 		"-service", h.opts.Service,
 		"-url", svcURL("/"),
 		"-concurrency", fmt.Sprintf("%d", concurrency),
 		"-duration", loadTime.String(),
+		"-gate-mode", mode,
+		"-connection-close-denominator", "1000",
 	}
 	if err := h.StartTesterJob(ctx, jobName, args); err != nil {
 		t.Fatalf("start rollout tester: %v", err)
@@ -875,8 +886,10 @@ func TestE2ERolloutReplacement(t *testing.T) {
 	time.Sleep(3 * time.Second)
 
 	// Zero-downtime rolling replacement: the new ReplicaSet must become fully
-	// ready before the old Pods are removed.
-	patch := `{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":"100%","maxUnavailable":"0%"}},"template":{"metadata":{"labels":{"rollout":"v2"}}}}}`
+	// ready before the old Pods are removed. Use a unique template label per
+	// invocation so repeated runs always trigger a new ReplicaSet.
+	patch := fmt.Sprintf(`{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":"100%%","maxUnavailable":"0%%"}},"template":{"metadata":{"labels":{"rollout":%q}}}}}`,
+		fmt.Sprintf("r-%s-%d", mode, time.Now().UnixNano()))
 	if _, err := h.run(ctx, h.kubect, "--kubeconfig", h.kubeconfigPath(),
 		"patch", "deployment/downstream", "-n", h.opts.Namespace, "--type", "strategic", "-p", patch); err != nil {
 		t.Fatalf("patch rollout: %v", err)
@@ -914,8 +927,12 @@ func TestE2ERolloutReplacement(t *testing.T) {
 	}
 
 	errorRatio := float64(res.Errors) / float64(res.Requests)
-	if errorRatio > 0.001 {
-		t.Fatalf("rollout error ratio %.4f%% exceeds 0.1%%: errors=%d kinds=%v samples=%v", errorRatio*100, res.Errors, res.ErrorKinds, res.ErrorSamples)
+	maxErrorRatio := 0.001
+	if mode == "clusterip" {
+		maxErrorRatio = 0.005
+	}
+	if errorRatio > maxErrorRatio {
+		t.Fatalf("rollout %s error ratio %.4f%% exceeds %.1f%%: errors=%d kinds=%v samples=%v", mode, errorRatio*100, maxErrorRatio*100, res.Errors, res.ErrorKinds, res.ErrorSamples)
 	}
 	for i, window := range res.Windows {
 		if i > 0 && i < len(res.Windows)-1 && window.Success == 0 {
@@ -937,10 +954,10 @@ func TestE2ERolloutReplacement(t *testing.T) {
 		}
 	}
 
-	t.Logf("rollout summary: requests=%d errors=%d errorRatio=%.4f%% throughput=%.1f/s p50=%.2f p95=%.2f p99=%.2f max=%.2fms reuse=%.4f oldPods=%d newPods=%d firstSeen=%v backends=%d distribution=%v errorKinds=%v",
-		res.Requests, res.Errors, errorRatio*100, res.Throughput,
+	t.Logf("rollout %s summary: requests=%d errors=%d errorRatio=%.4f%% throughput=%.1f/s p50=%.2f p95=%.2f p99=%.2f max=%.2fms reuse=%.4f rotations=%d oldPods=%d newPods=%d firstSeen=%v backends=%d distribution=%v errorKinds=%v",
+		mode, res.Requests, res.Errors, errorRatio*100, res.Throughput,
 		res.LatencyP50Ms, res.LatencyP95Ms, res.LatencyP99Ms, res.LatencyMaxMs,
-		res.ReusedRatio, len(oldPods), len(newPods), firstSeen, len(res.ByPod), res.ByPod, res.ErrorKinds)
+		res.ReusedRatio, res.Rotations, len(oldPods), len(newPods), firstSeen, len(res.ByPod), res.ByPod, res.ErrorKinds)
 }
 
 func distributionRange(distribution map[string]int) (minCount, maxCount int) {

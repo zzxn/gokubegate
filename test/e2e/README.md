@@ -17,7 +17,8 @@ and exercise gokubegate from an in-cluster Job. The suite currently covers:
   both `pod` and `clusterip` modes, with per-second pod distribution windows to
   quantify scale-up convergence.
 - zero-downtime rollout replacement (10 old Pods -> 10 new Pods -> old removed)
-  under sustained 128-way load (`TestE2ERolloutReplacement`).
+  under sustained 128-way load for both `pod` and `clusterip` modes
+  (`TestE2ERolloutReplacement` / `TestE2ERolloutReplacementClusterIP`).
 
 The rapid-scaling scenario keeps one client active for 24 seconds while the
 Deployment receives `2 -> 8 -> 2 -> 6 -> 1 -> 4` replica updates every two
