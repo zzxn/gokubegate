@@ -11,6 +11,11 @@ and exercise gokubegate from an in-cluster Job. The suite currently covers:
 - SSE stream affinity across concurrent long-lived streams (S6);
 - last-known-good routing while the kind control plane is paused (S7);
 - 1/8/32/64 concurrency gradients and sustained 64-way rapid scaling.
+- `pod` versus `clusterip` mode distribution, including ClusterIP with sampled
+  rotation disabled and enabled.
+- rapid scaling (`2 -> 8 -> 2 -> 6 -> 1 -> 4`) under sustained 64-way load for
+  both `pod` and `clusterip` modes, with per-second pod distribution windows to
+  quantify scale-up convergence.
 
 The rapid-scaling scenario keeps one client active for 24 seconds while the
 Deployment receives `2 -> 8 -> 2 -> 6 -> 1 -> 4` replica updates every two

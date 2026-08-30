@@ -22,15 +22,18 @@ import (
 // TesterResult mirrors the JSON emitted by the tester CLI.
 type TesterResult struct {
 	Phase           string                 `json:"phase"`
+	Mode            string                 `json:"mode"`
 	Requests        int                    `json:"requests"`
 	Success         int                    `json:"success"`
 	Errors          int                    `json:"errors"`
 	Concurrency     int                    `json:"concurrency"`
 	ByEndpoint      map[string]int         `json:"byEndpoint"`
+	ByPod           map[string]int         `json:"byPod"`
 	ErrorKinds      map[string]int         `json:"errorKinds"`
 	ErrorSamples    map[string]string      `json:"errorSamples"`
 	Reused          int                    `json:"reused"`
 	Connections     int                    `json:"connections"`
+	Rotations       int                    `json:"rotations"`
 	ReusedRatio     float64                `json:"reusedRatio"`
 	HostEcho        string                 `json:"hostEcho"`
 	PathEcho        string                 `json:"pathEcho"`
@@ -46,11 +49,12 @@ type TesterResult struct {
 }
 
 type TesterWindow struct {
-	Second       int     `json:"second"`
-	Requests     int     `json:"requests"`
-	Success      int     `json:"success"`
-	Errors       int     `json:"errors"`
-	LatencyP95Ms float64 `json:"latencyP95Ms"`
+	Second       int            `json:"second"`
+	Requests     int            `json:"requests"`
+	Success      int            `json:"success"`
+	Errors       int            `json:"errors"`
+	LatencyP95Ms float64        `json:"latencyP95Ms"`
+	ByPod        map[string]int `json:"byPod"`
 }
 
 type TesterEndpointUpdate struct {

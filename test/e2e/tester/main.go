@@ -24,15 +24,18 @@ const readyMarker = "GOKUBEGATE_TESTER_READY"
 
 type TesterResult struct {
 	Phase           string            `json:"phase"`
+	Mode            string            `json:"mode"`
 	Requests        int               `json:"requests"`
 	Success         int               `json:"success"`
 	Errors          int               `json:"errors"`
 	Concurrency     int               `json:"concurrency"`
 	ByEndpoint      map[string]int    `json:"byEndpoint"`
+	ByPod           map[string]int    `json:"byPod"`
 	ErrorKinds      map[string]int    `json:"errorKinds,omitempty"`
 	ErrorSamples    map[string]string `json:"errorSamples,omitempty"`
 	Reused          int               `json:"reused"`
 	Connections     int               `json:"connections"`
+	Rotations       int               `json:"rotations"`
 	ReusedRatio     float64           `json:"reusedRatio"`
 	HostEcho        string            `json:"hostEcho"`
 	PathEcho        string            `json:"pathEcho"`
@@ -50,11 +53,12 @@ type TesterResult struct {
 // WindowResult summarizes requests completed during one second of sustained
 // load, so a short outage cannot be hidden by aggregate success counts.
 type WindowResult struct {
-	Second       int     `json:"second"`
-	Requests     int     `json:"requests"`
-	Success      int     `json:"success"`
-	Errors       int     `json:"errors"`
-	LatencyP95Ms float64 `json:"latencyP95Ms"`
+	Second       int            `json:"second"`
+	Requests     int            `json:"requests"`
+	Success      int            `json:"success"`
+	Errors       int            `json:"errors"`
+	LatencyP95Ms float64        `json:"latencyP95Ms"`
+	ByPod        map[string]int `json:"byPod,omitempty"`
 }
 
 type EndpointUpdate struct {
@@ -64,6 +68,7 @@ type EndpointUpdate struct {
 }
 
 type identity struct {
+	Pod   string `json:"pod"`
 	Host  string `json:"host"`
 	Path  string `json:"path"`
 	Query string `json:"query"`
@@ -74,6 +79,7 @@ type windowMetrics struct {
 	success  int
 	errors   int
 	latency  []time.Duration
+	byPod    map[string]int
 }
 
 type metrics struct {
@@ -83,10 +89,12 @@ type metrics struct {
 	success      int
 	errors       int
 	byEndpoint   map[string]int
+	byPod        map[string]int
 	errorKinds   map[string]int
 	errorSamples map[string]string
 	reused       int
 	connections  int
+	rotations    int
 	latency      []time.Duration
 	windows      map[int]*windowMetrics
 	updates      []EndpointUpdate
@@ -97,6 +105,7 @@ func newMetrics(start time.Time) *metrics {
 	return &metrics{
 		start:        start,
 		byEndpoint:   make(map[string]int),
+		byPod:        make(map[string]int),
 		errorKinds:   make(map[string]int),
 		errorSamples: make(map[string]string),
 		windows:      make(map[int]*windowMetrics),
@@ -115,6 +124,8 @@ func (m *metrics) handleEvent(event gokubegate.Event) {
 		})
 	case gokubegate.EventEndpointPicked:
 		m.byEndpoint[event.Endpoint]++
+	case gokubegate.EventConnectionRotated:
+		m.rotations++
 	case gokubegate.EventRequestDone:
 		m.connections++
 		if event.Reused {
@@ -137,7 +148,7 @@ func (m *metrics) record(latency time.Duration, err error, id identity) {
 	second := int(time.Since(m.start) / time.Second)
 	window := m.windows[second]
 	if window == nil {
-		window = &windowMetrics{}
+		window = &windowMetrics{byPod: make(map[string]int)}
 		m.windows[second] = window
 	}
 	window.requests++
@@ -163,23 +174,30 @@ func (m *metrics) record(latency time.Duration, err error, id identity) {
 	if id.Host != "" {
 		m.last = id
 	}
+	if id.Pod != "" {
+		m.byPod[id.Pod]++
+		window.byPod[id.Pod]++
+	}
 }
 
-func (m *metrics) result(phase string, concurrency int, elapsed time.Duration) TesterResult {
+func (m *metrics) result(phase, mode string, concurrency int, elapsed time.Duration) TesterResult {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	result := TesterResult{
 		Phase:           phase,
+		Mode:            mode,
 		Requests:        m.success + m.errors,
 		Success:         m.success,
 		Errors:          m.errors,
 		Concurrency:     concurrency,
 		ByEndpoint:      m.byEndpoint,
+		ByPod:           m.byPod,
 		ErrorKinds:      m.errorKinds,
 		ErrorSamples:    m.errorSamples,
 		Reused:          m.reused,
 		Connections:     m.connections,
+		Rotations:       m.rotations,
 		HostEcho:        m.last.Host,
 		PathEcho:        m.last.Path,
 		QueryEcho:       m.last.Query,
@@ -210,6 +228,7 @@ func (m *metrics) result(phase string, concurrency int, elapsed time.Duration) T
 			Success:      window.success,
 			Errors:       window.errors,
 			LatencyP95Ms: percentileMs(window.latency, 0.95),
+			ByPod:        window.byPod,
 		})
 	}
 	return result
@@ -259,8 +278,12 @@ func main() {
 	requests := flag.Int("requests", 100, "number of requests when duration is zero")
 	concurrency := flag.Int("concurrency", 1, "number of concurrent request workers")
 	duration := flag.Duration("duration", 0, "sustained load duration; overrides requests when non-zero")
+	rate := flag.Int("rate", 0, "optional total requests/second cap; 0 = unlimited (requires -duration)")
 	host := flag.String("host", "", "optional explicit Host header")
 	mode := flag.String("mode", "http", "request mode: http or sse")
+	gateMode := flag.String("gate-mode", string(gokubegate.ModePod), "gokubegate mode: pod or clusterip")
+	closeDenominator := flag.Uint64("connection-close-denominator", 1000, "ClusterIP connection-close sample denominator; 0 disables")
+	maxIdle := flag.Int("max-idle-conns", 32, "max idle keep-alive connections per Pod")
 	flag.Parse()
 
 	if *namespace == "" || *service == "" || *targetURL == "" {
@@ -269,6 +292,10 @@ func main() {
 	}
 	if *concurrency < 1 || (*duration <= 0 && *requests < 1) {
 		fmt.Fprintln(os.Stderr, "concurrency and requests must be positive")
+		os.Exit(2)
+	}
+	if *rate < 0 || (*rate > 0 && *duration <= 0) {
+		fmt.Fprintln(os.Stderr, "rate requires a positive duration")
 		os.Exit(2)
 	}
 	if *mode != "http" && *mode != "sse" {
@@ -281,6 +308,9 @@ func main() {
 
 	metrics := newMetrics(time.Now())
 	client, err := gokubegate.NewClient(ctx, *namespace, *service,
+		gokubegate.WithMode(gokubegate.Mode(*gateMode)),
+		gokubegate.WithConnectionCloseSampleDenominator(*closeDenominator),
+		gokubegate.WithMaxIdleConnsPerPod(*maxIdle),
 		gokubegate.WithHook(gokubegate.HookFunc(metrics.handleEvent)),
 		gokubegate.WithCacheSyncTimeout(30*time.Second),
 	)
@@ -298,11 +328,17 @@ func main() {
 
 	var next atomic.Int64
 	deadline := start.Add(*duration)
+	paceInterval := time.Duration(0)
+	if *rate > 0 {
+		paceInterval = time.Duration(float64(time.Second) * float64(*concurrency) / float64(*rate))
+	}
 	var workers sync.WaitGroup
 	for range *concurrency {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
+			requestIndex := 0
+			workerStart := time.Now()
 			for {
 				if *duration > 0 {
 					if !time.Now().Before(deadline) {
@@ -310,6 +346,19 @@ func main() {
 					}
 				} else if next.Add(1) > int64(*requests) {
 					return
+				}
+				if paceInterval > 0 {
+					target := workerStart.Add(time.Duration(requestIndex) * paceInterval)
+					if wait := time.Until(target); wait > 0 {
+						timer := time.NewTimer(wait)
+						select {
+						case <-timer.C:
+						case <-ctx.Done():
+							timer.Stop()
+							return
+						}
+					}
+					requestIndex++
 				}
 				if *mode == "sse" {
 					doSSE(ctx, client, metrics, *targetURL, *host)
@@ -321,7 +370,7 @@ func main() {
 	}
 	workers.Wait()
 
-	result := metrics.result(*phase, *concurrency, time.Since(start))
+	result := metrics.result(*phase, *gateMode, *concurrency, time.Since(start))
 	out, _ := json.Marshal(result)
 	fmt.Println(string(out))
 }
@@ -336,6 +385,7 @@ func doSSE(ctx context.Context, client *gokubegate.Client, metrics *metrics, tar
 	if host != "" {
 		req.Host = host
 	}
+	req.Header.Set("Accept", "text/event-stream")
 	resp, err := client.Do(req)
 	if err != nil {
 		metrics.record(time.Since(started), err, identity{})
@@ -378,7 +428,7 @@ func doSSE(ctx context.Context, client *gokubegate.Client, metrics *metrics, tar
 		metrics.record(time.Since(started), errors.New("sse_no_events"), identity{})
 		return
 	}
-	metrics.record(time.Since(started), nil, identity{})
+	metrics.record(time.Since(started), nil, identity{Pod: selectedPod})
 }
 
 func doRequest(ctx context.Context, client *gokubegate.Client, metrics *metrics, targetURL, host string) {
