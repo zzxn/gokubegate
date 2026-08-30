@@ -846,6 +846,103 @@ func TestE2EModeBenchmark(t *testing.T) {
 	}
 }
 
+// TestE2ERolloutReplacement simulates a rolling release: 10 running Pods, 10
+// replacement Pods start and become ready, then the old 10 are removed
+// (maxSurge=100%, maxUnavailable=0). Sustained load must keep flowing with a
+// low error rate and no full-second outage while the new Pods receive traffic.
+func TestE2ERolloutReplacement(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+	oldPods := ensureDownstream(t, ctx, 10)
+	defer ensureDownstream(t, ctx, 2)
+
+	const (
+		jobName     = "tester-rollout"
+		concurrency = 128
+		loadTime    = 120 * time.Second
+	)
+	args := []string{
+		"-phase", "rollout",
+		"-namespace", h.opts.Namespace,
+		"-service", h.opts.Service,
+		"-url", svcURL("/"),
+		"-concurrency", fmt.Sprintf("%d", concurrency),
+		"-duration", loadTime.String(),
+	}
+	if err := h.StartTesterJob(ctx, jobName, args); err != nil {
+		t.Fatalf("start rollout tester: %v", err)
+	}
+	time.Sleep(3 * time.Second)
+
+	// Zero-downtime rolling replacement: the new ReplicaSet must become fully
+	// ready before the old Pods are removed.
+	patch := `{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":"100%","maxUnavailable":"0%"}},"template":{"metadata":{"labels":{"rollout":"v2"}}}}}`
+	if _, err := h.run(ctx, h.kubect, "--kubeconfig", h.kubeconfigPath(),
+		"patch", "deployment/downstream", "-n", h.opts.Namespace, "--type", "strategic", "-p", patch); err != nil {
+		t.Fatalf("patch rollout: %v", err)
+	}
+	if _, err := h.run(ctx, h.kubect, "--kubeconfig", h.kubeconfigPath(),
+		"rollout", "status", "deployment/downstream", "-n", h.opts.Namespace, "--timeout=3m"); err != nil {
+		t.Fatalf("rollout status: %v", err)
+	}
+
+	logs, err := h.WaitTesterJob(ctx, jobName)
+	if err != nil {
+		t.Fatalf("wait rollout tester: %v", err)
+	}
+	res, err := ParseTesterResult(logs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	finalPods, err := h.ReadyEndpointPodNames(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSet := make(map[string]bool, len(oldPods))
+	for _, pod := range oldPods {
+		oldSet[pod] = true
+	}
+	var newPods []string
+	for _, pod := range finalPods {
+		if !oldSet[pod] {
+			newPods = append(newPods, pod)
+		}
+	}
+	if len(newPods) != 10 {
+		t.Fatalf("expected 10 new Pods after rollout, got %v", newPods)
+	}
+
+	errorRatio := float64(res.Errors) / float64(res.Requests)
+	if errorRatio > 0.001 {
+		t.Fatalf("rollout error ratio %.4f%% exceeds 0.1%%: errors=%d kinds=%v samples=%v", errorRatio*100, res.Errors, res.ErrorKinds, res.ErrorSamples)
+	}
+	for i, window := range res.Windows {
+		if i > 0 && i < len(res.Windows)-1 && window.Success == 0 {
+			t.Fatalf("complete second %d had no successful requests: %+v", window.Second, window)
+		}
+	}
+
+	firstSeen := make(map[string]int)
+	for _, window := range res.Windows {
+		for pod := range window.ByPod {
+			if _, ok := firstSeen[pod]; !ok {
+				firstSeen[pod] = window.Second
+			}
+		}
+	}
+	for _, pod := range newPods {
+		if _, ok := firstSeen[pod]; !ok {
+			t.Fatalf("new pod %s received no traffic during rollout; firstSeen=%v", pod, firstSeen)
+		}
+	}
+
+	t.Logf("rollout summary: requests=%d errors=%d errorRatio=%.4f%% throughput=%.1f/s p50=%.2f p95=%.2f p99=%.2f max=%.2fms reuse=%.4f oldPods=%d newPods=%d firstSeen=%v backends=%d distribution=%v errorKinds=%v",
+		res.Requests, res.Errors, errorRatio*100, res.Throughput,
+		res.LatencyP50Ms, res.LatencyP95Ms, res.LatencyP99Ms, res.LatencyMaxMs,
+		res.ReusedRatio, len(oldPods), len(newPods), firstSeen, len(res.ByPod), res.ByPod, res.ErrorKinds)
+}
+
 func distributionRange(distribution map[string]int) (minCount, maxCount int) {
 	first := true
 	for _, count := range distribution {
