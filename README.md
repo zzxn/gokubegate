@@ -1,14 +1,29 @@
 # gokubegate
 
-Client-side pod load balancing for Go services running inside Kubernetes.
+A drop-in `*http.Client` that gives Go services **per-Pod load balancing** inside
+Kubernetes — no infrastructure changes, no sidecar, no custom DNS.
 
-`gokubegate` is a generic Go client library with two routing modes: deterministic
-request-level balancing across ready EndpointSlice Pods, or a shared Transport
-through the Service ClusterIP with sampled connection rotation.
+`gokubegate.NewClient(ctx, namespace, service, ...)` returns a ready-to-use
+`*http.Client`. Under the hood it is an `http.RoundTripper`, so the standard
+`net/http` API — and any code built on it — keeps working unchanged.
 
-It is a generalization of the client-side pod load-balancing design validated
-in a production Kubernetes gateway (see design rationale in
-[docs/spec/technical-design.md](./docs/spec/technical-design.md)).
+**Why you need it** — Kubernetes `Service` load balancing happens at L4: the
+endpoint is chosen once per TCP connection. Go's `http.Transport` reuses those
+keep-alive connections, so requests concentrate on a few Pods, and HTTP/2
+multiplexing amplifies the imbalance.
+
+**What it does** — gokubegate watches `EndpointSlice`s, picks a Ready Pod for
+each request, and dials the Pod IP directly with a dedicated connection pool
+per Pod. The logical `Host` and URL are preserved.
+
+Two routing modes:
+
+- `pod` — deterministic, request-level balancing across Ready Pods (recommended).
+- `clusterip` — a shared Transport through the Service ClusterIP with sampled
+  connection rotation, for environments where direct Pod routing is not allowed.
+
+Zero metrics/logging dependencies by default; observability is pluggable via
+event hooks (`WithHook`).
 
 ## Features
 
