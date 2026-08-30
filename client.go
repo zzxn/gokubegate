@@ -12,10 +12,9 @@ type Client struct {
 	gate *Gate
 }
 
-// NewClient creates a Client that load-balances requests across the ready
-// pods of the given Kubernetes Service. It blocks until the informer cache
-// has synced (or CacheSyncTimeout elapses) so the returned client is ready
-// to use immediately.
+// NewClient creates a Client for the given Kubernetes Service. ModePod
+// balances across ready Pods and waits for informer sync; ModeClusterIP uses
+// one shared Transport through the Service address.
 func NewClient(ctx context.Context, namespace, service string, opts ...Option) (*Client, error) {
 	gate, err := NewGate(ctx, namespace, service, opts...)
 	if err != nil {
@@ -30,7 +29,8 @@ func NewClient(ctx context.Context, namespace, service string, opts ...Option) (
 // Close stops discovery and drains in-flight requests. It is idempotent.
 func (c *Client) Close() error { return c.gate.Close() }
 
-// Endpoints returns a read-only view of the current ready backends.
+// Endpoints returns a read-only view of current ready Pod backends. It returns
+// nil in ModeClusterIP because that mode does not discover EndpointSlices.
 func (c *Client) Endpoints() []EndpointInfo { return c.gate.Endpoints() }
 
 // RoundTripper exposes the underlying http.RoundTripper so advanced users can
@@ -39,4 +39,4 @@ func (c *Client) Endpoints() []EndpointInfo { return c.gate.Endpoints() }
 func (c *Client) RoundTripper() http.RoundTripper { return c.gate }
 
 // Mode reports the routing mode. Always "pod" in v0.1.
-func (c *Client) Mode() string { return "pod" }
+func (c *Client) Mode() string { return string(c.gate.cfg.Mode) }

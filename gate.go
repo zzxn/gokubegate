@@ -9,29 +9,43 @@ import (
 	"time"
 )
 
-// Gate is an http.RoundTripper that load-balances each request across the
-// ready pods of a Kubernetes Service, using per-pod connection pools.
+// Gate is an http.RoundTripper that routes through either ready Pod endpoints
+// or the Kubernetes Service ClusterIP, according to Config.Mode.
 // It is safe for concurrent use by multiple goroutines and can be shared by
 // several http.Client instances with different timeouts.
 type Gate struct {
-	discovery *discovery
-	strategy  Strategy
-	cfg       *Config
-	closed    atomic.Bool
+	discovery          *discovery
+	clusterIPTransport *http.Transport
+	strategy           Strategy
+	cfg                *Config
+	shouldClose        func(uint64) bool
+	closed             atomic.Bool
 }
 
-// NewGate creates a Gate for the given Kubernetes Service. It blocks until
-// the EndpointSlice informer cache has synced (or CacheSyncTimeout elapses).
+// NewGate creates a Gate for the given Kubernetes Service. ModePod blocks
+// until the EndpointSlice informer cache has synced; ModeClusterIP only
+// resolves the Service port when one was not explicitly configured.
 func NewGate(ctx context.Context, namespace, service string, opts ...Option) (*Gate, error) {
 	cfg, err := buildConfig(namespace, service, opts...)
 	if err != nil {
 		return nil, err
 	}
-	d, err := newDiscovery(ctx, cfg)
-	if err != nil {
-		return nil, err
+	g := &Gate{strategy: cfg.Strategy, cfg: cfg, shouldClose: shouldCloseClusterIPConnection}
+	switch cfg.Mode {
+	case ModePod:
+		d, err := newDiscovery(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		g.discovery = d
+	case ModeClusterIP:
+		transport, err := newClusterIPTransport(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		g.clusterIPTransport = transport
 	}
-	return &Gate{discovery: d, strategy: cfg.Strategy, cfg: cfg}, nil
+	return g, nil
 }
 
 // buildConfig applies options, resolves logging, and validates.
@@ -61,7 +75,13 @@ func (g *Gate) RoundTrip(req *http.Request) (*http.Response, error) {
 	if g.closed.Load() {
 		return nil, fmt.Errorf("gokubegate: gate is closed")
 	}
+	if g.cfg.Mode == ModeClusterIP {
+		return g.roundTripClusterIP(req)
+	}
+	return g.roundTripPod(req)
+}
 
+func (g *Gate) roundTripPod(req *http.Request) (*http.Response, error) {
 	start := time.Now()
 	backend, err := g.pickBackend()
 	if err != nil {
@@ -86,6 +106,38 @@ func (g *Gate) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	emit(g.cfg, Event{Kind: EventRequestDone, Endpoint: backend.label, Result: "success", Reused: reused, Duration: time.Since(start)})
+	return resp, nil
+}
+
+func (g *Gate) roundTripClusterIP(req *http.Request) (*http.Response, error) {
+	start := time.Now()
+	var reused bool
+	traceCtx := httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) { reused = info.Reused },
+	})
+	clone := req.Clone(traceCtx)
+	u := *clone.URL
+	clone.URL = &u
+	originalAuthority := clone.URL.Host
+	if clone.URL.Scheme == "" {
+		clone.URL.Scheme = g.cfg.Scheme
+	}
+	logicalHost := logicalServiceHost(g.cfg)
+	clone.URL.Host = logicalHost
+	if clone.Host == "" || clone.Host == originalAuthority {
+		clone.Host = logicalHost
+	}
+	if !clone.Close && !isEventStreamRequest(clone) && g.shouldClose(g.cfg.ConnectionCloseSampleDenominator) {
+		clone.Close = true
+		emit(g.cfg, Event{Kind: EventConnectionRotated})
+	}
+
+	resp, err := g.clusterIPTransport.RoundTrip(clone)
+	if err != nil {
+		emit(g.cfg, Event{Kind: EventRequestDone, Result: "error", Duration: time.Since(start)})
+		return nil, err
+	}
+	emit(g.cfg, Event{Kind: EventRequestDone, Result: "success", Reused: reused, Duration: time.Since(start)})
 	return resp, nil
 }
 
@@ -129,13 +181,21 @@ func rewriteRequest(cfg *Config, logicalHost string, clone *http.Request, backen
 // Close stops discovery and drains all backends. It is idempotent.
 func (g *Gate) Close() error {
 	if g.closed.CompareAndSwap(false, true) {
-		g.discovery.stop()
+		if g.discovery != nil {
+			g.discovery.stop()
+		}
+		if g.clusterIPTransport != nil {
+			g.clusterIPTransport.CloseIdleConnections()
+		}
 	}
 	return nil
 }
 
 // Endpoints returns a read-only view of the current ready backends.
 func (g *Gate) Endpoints() []EndpointInfo {
+	if g.discovery == nil {
+		return nil
+	}
 	snap := g.discovery.currentSnapshot()
 	infos := make([]EndpointInfo, 0, len(snap.Backends))
 	for _, b := range snap.Backends {

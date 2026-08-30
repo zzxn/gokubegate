@@ -231,12 +231,12 @@ type PodBackend struct {
 
 - **单 transport profile**（区别于内部网关常见的 normal/admin/SSE 三 profile）：client 级超时由用户的 `http.Client` 决定，transport 只需管理连接；同一 Gate 可被多个超时语义不同的 client 共享（见 5.3）。这是通用库相对内部网关的简化与泛化。
 - transport 参数（默认值，均可通过选项覆盖）：
-  - `MaxIdleConns` / `MaxIdleConnsPerHost`：`maxIdleConnsPerPod`（默认 16），两值设为相同；
+  - `MaxIdleConns` / `MaxIdleConnsPerHost`：`maxIdleConnsPerPod`（默认 32），两值设为相同；
   - `IdleConnTimeout`：90s；`DialContext.Timeout`：5s；`TCPKeepAlive`：30s；
   - `ResponseHeaderTimeout`：15s（SSE 也适用，只影响首个响应头等待）；
   - `MaxConnsPerHost`：0（不设硬上限，避免客户端隐式排队等待）；
   - `ForceAttemptHTTP2`：false（见 8.4）。
-- **连接预算**（文档约束使用者）：`下游 Pod 数 × 每 Pod idle 上限 × 使用该库的副本数`，默认值 16 是安全起点，需按峰值并发压测确定：`maxIdleConnsPerPod >= 每 Pod 峰值 RPS × 下游 P99 秒数 × 1.5~2`。
+- **连接预算**（文档约束使用者）：`下游 Pod 数 × 每 Pod idle 上限 × 使用该库的副本数`，默认值 32 是安全起点，需按峰值并发压测确定：`maxIdleConnsPerPod >= 每 Pod 峰值 RPS × 下游 P99 秒数 × 1.5~2`。
 - 不按请求创建 transport；transport 与 PodBackend 同生命周期。
 
 ### 7.5 Gate（http.RoundTripper）
@@ -263,7 +263,7 @@ type Client struct {
 
 func (c *Client) Close() error          // 停 informer → drain 全部 backend → 释放
 func (c *Client) Endpoints() []EndpointInfo // 当前快照（调试/观测）
-func (c *Client) Mode() string          // "pod"（v0.1 固定）
+func (c *Client) Mode() string          // "pod" 或 "clusterip"
 ```
 
 `NewClient` 阻塞直到 informer cache sync（默认 20s，可配），保证返回的 client 立即可用；失败返回明确错误（配置、RBAC、超时）。
@@ -503,30 +503,38 @@ gokubegate/
 4. 是否需要在库内提供 Service DNS 回退模式开关（默认不开，文档说明风险）；
 5. 开源协议选择（建议 Apache-2.0）。
 
-## 17. TODO：Service 连接轮换模式
+## 17. ClusterIP 模式
 
-除当前直接发现并选择 Pod 的 `pod` 模式外，后续需要实现一个并列的 **Service 连接轮换模式**
-（最终公开名称待定，可暂称 `service-rotate`）。该模式复用单个 `http.Transport` / 连接池，仍然
+除直接发现并选择 Pod 的 `pod` 模式外，当前实现提供并列的 **`clusterip` 模式**。
+该模式复用单个 `http.Transport` / 连接池，仍然
 访问 Kubernetes Service DNS/ClusterIP，不直接拨 Pod IP；通过低比例随机设置
 `http.Request.Close = true`，让承载本次普通 HTTP 请求的连接在响应完成后退出连接池，促使后续
 新连接由 Kubernetes L4 Service 重新选择 endpoint。
 
-该 TODO 复刻 demo 已验证的连接轮换语义，并与 `pod` 模式保持清晰边界：
+该模式复刻内部网关已验证的连接轮换语义，并与 `pod` 模式保持清晰边界：
 
 - `pod`：EndpointSlice + 请求级 Picker + 每 Pod 独立 Transport，提供确定性的 Ready Pod 分发；
-- `service-rotate`：单一共享 Transport + Service 地址 + 概率性连接轮换，只改善长连接粘连，
+- `clusterip`：单一共享 Transport + Service 地址 + 概率性连接轮换，只改善长连接粘连，
   不承诺请求级精确均衡；
-- 配置使用采样分母表达，例如 `0` 表示关闭，`100` 表示约 1% 请求设置 `req.Close`；生产配置
-  必须限制最低分母（demo 当前为 100），避免过高轮换率造成连接风暴；
-- 只对普通、可在有限时间内完成响应的 HTTP 请求采样；SSE/流式请求默认不参与随机关闭；
+- 配置使用采样分母表达：`0` 表示关闭，默认 `1000` 表示约 0.1% 请求设置 `req.Close`；非零值
+  最低为 100，避免过高轮换率造成连接风暴；
+- 只对普通、可在有限时间内完成响应的 HTTP 请求采样；带
+  `Accept: text/event-stream` 的 SSE 请求不参与随机关闭；
 - 必须保留用户显式 `req.Close`，并保证不修改调用方原始 Request（clone 后再设置）；
-- 提供轮换次数、连接复用率等 Hook 事件，并让 `Client.Mode()` 返回实际模式；
-- API 设计需明确模式枚举和选项（如 `WithMode(...)`、`WithConnectionCloseSampleDenominator(...)`），
-  默认仍为当前 `pod` 模式，避免已有行为变化。
+- 提供 `EventConnectionRotated` Hook 事件，并让 `Client.Mode()` 返回实际模式；
+- API 使用 `ModePod`、`ModeClusterIP`、`WithMode(...)` 和
+  `WithConnectionCloseSampleDenominator(...)`，默认仍为 `pod`，已有行为不变；
+- 未显式配置 `WithPort` 时，只读取 Service 解析 Service port，不启动 EndpointSlice informer；
+  显式配置端口时不需要 Kubernetes API 权限。
 
-实施验收至少包含：采样边界单测、并发/race、SSE 不轮换、共享 Transport 复用，以及在真实
-Kubernetes Service 下对比 `pod`、纯 L4 keep-alive、`service-rotate` 三种模式的分布、吞吐、
-p99、新建连接率和扩容收敛速度。
+真实集群串行 8000 请求对照结果：`pod` 为 2000/2000/2000/2000；关闭轮换的 `clusterip`
+为 8000/0/0/0；默认 0.1% 轮换采样 10 次后覆盖四个 Pod，但分布为
+5156/1624/830/390。结果验证了精确请求级均衡、L4 keep-alive 粘连和概率轮换三者的差异。
+
+64 并发、每档 5 秒时，共享 Transport 会自然建立多条连接，因此两个模式都覆盖四个 Pod：
+`pod` 四 Pod 差值仅 1；无轮换 `clusterip` 的最大最小差占总请求 0.58%；0.1% 轮换本次为
+1.65%。低概率轮换在高并发短窗口不保证改善瞬时均匀度，其主要价值是让长生命周期连接池持续
+更新，并在扩容后逐步建立映射到新 endpoint 的连接。
 
 ## 18. 参考资料
 

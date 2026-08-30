@@ -29,16 +29,34 @@ type PodBackend struct {
 }
 
 func newPodBackend(key EndpointKey, address, podName, nodeName, logicalHost string, cfg *Config) *PodBackend {
+	tr := newHTTPTransport(cfg, logicalHost, cfg.MaxIdleConnsPerPod)
+
+	return &PodBackend{
+		key:       key,
+		address:   address,
+		podName:   podName,
+		nodeName:  nodeName,
+		label:     endpointLabel(podName, address),
+		transport: tr,
+		closed:    make(chan struct{}),
+	}
+}
+
+func newHTTPTransport(cfg *Config, logicalHost string, maxIdle int) *http.Transport {
 	var tlsConfig *tls.Config
 	if cfg.Scheme == "https" {
 		// TLS ServerName must be the logical service hostname, not the pod IP,
 		// so certificates must cover the service hostname.
-		tlsConfig = &tls.Config{ServerName: logicalHost, MinVersion: tls.VersionTLS12}
+		serverName := logicalHost
+		if host, _, err := net.SplitHostPort(logicalHost); err == nil {
+			serverName = host
+		}
+		tlsConfig = &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS12}
 	}
 
-	tr := &http.Transport{
-		MaxIdleConns:          cfg.MaxIdleConnsPerPod,
-		MaxIdleConnsPerHost:   cfg.MaxIdleConnsPerPod,
+	return &http.Transport{
+		MaxIdleConns:          maxIdle,
+		MaxIdleConnsPerHost:   maxIdle,
 		MaxConnsPerHost:       0,
 		IdleConnTimeout:       cfg.IdleConnTimeout,
 		TLSHandshakeTimeout:   cfg.DialTimeout,
@@ -55,16 +73,6 @@ func newPodBackend(key EndpointKey, address, podName, nodeName, logicalHost stri
 		DisableCompression:    false,
 		ResponseHeaderTimeout: cfg.ResponseHeaderTimeout,
 		DisableKeepAlives:     false,
-	}
-
-	return &PodBackend{
-		key:       key,
-		address:   address,
-		podName:   podName,
-		nodeName:  nodeName,
-		label:     endpointLabel(podName, address),
-		transport: tr,
-		closed:    make(chan struct{}),
 	}
 }
 

@@ -16,10 +16,14 @@ const (
 	EventReconcile EventKind = "reconcile"
 	// EventEndpointDrained fires when a removed endpoint finishes draining.
 	EventEndpointDrained EventKind = "endpoint_drained"
+	// EventConnectionRotated fires when ModeClusterIP samples an ordinary
+	// request for connection close. It does not fire for explicit req.Close.
+	EventConnectionRotated EventKind = "connection_rotated"
 )
 
 // Event is delivered to all registered hooks. Fields are only meaningful for
-// specific kinds; hooks should switch on Kind.
+// specific kinds; hooks should switch on Kind. Endpoint is empty for
+// ModeClusterIP request events because kube-proxy owns endpoint selection.
 type Event struct {
 	Kind    EventKind
 	Service string // target service name

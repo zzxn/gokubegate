@@ -14,8 +14,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	discoveryinformers "k8s.io/client-go/informers/discovery/v1"
 	"k8s.io/client-go/informers"
+	discoveryinformers "k8s.io/client-go/informers/discovery/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
@@ -54,16 +54,9 @@ type endpointMeta struct {
 // newDiscovery builds the informer, resolves the target port, and blocks until
 // the informer cache has synced (or CacheSyncTimeout elapses).
 func newDiscovery(ctx context.Context, cfg *Config) (*discovery, error) {
-	clientset := cfg.Clientset
-	if clientset == nil {
-		restCfg, err := resolveRESTConfig(cfg)
-		if err != nil {
-			return nil, err
-		}
-		clientset, err = kubernetes.NewForConfig(restCfg)
-		if err != nil {
-			return nil, fmt.Errorf("gokubegate: create kubernetes clientset: %w", err)
-		}
+	clientset, err := resolveClientset(cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	// Resolve the target port from the Service unless explicitly configured.
@@ -125,6 +118,21 @@ func newDiscovery(ctx context.Context, cfg *Config) (*discovery, error) {
 	d.reconcile()
 
 	return d, nil
+}
+
+func resolveClientset(cfg *Config) (kubernetes.Interface, error) {
+	if cfg.Clientset != nil {
+		return cfg.Clientset, nil
+	}
+	restCfg, err := resolveRESTConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	clientset, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		return nil, fmt.Errorf("gokubegate: create kubernetes clientset: %w", err)
+	}
+	return clientset, nil
 }
 
 func resolveRESTConfig(cfg *Config) (*rest.Config, error) {
@@ -317,10 +325,7 @@ func (d *discovery) currentSnapshot() *EndpointSnapshot {
 }
 
 func (d *discovery) logicalHost() string {
-	return net.JoinHostPort(
-		d.cfg.Service+"."+d.cfg.Namespace+".svc."+d.cfg.ClusterDomain,
-		portString(d.cfg.Port),
-	)
+	return logicalServiceHost(d.cfg)
 }
 
 func (d *discovery) stop() {

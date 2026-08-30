@@ -11,11 +11,27 @@ import (
 	"k8s.io/client-go/rest"
 )
 
+// Mode selects how requests reach the target Kubernetes Service.
+type Mode string
+
+const (
+	// ModePod discovers ready EndpointSlices and balances each request directly
+	// across Pod IPs using isolated per-Pod connection pools.
+	ModePod Mode = "pod"
+	// ModeClusterIP uses one shared connection pool through the Kubernetes
+	// Service ClusterIP. Optional sampled connection closing encourages L4
+	// endpoint rotation without guaranteeing request-level balance.
+	ModeClusterIP Mode = "clusterip"
+)
+
+const minimumConnectionCloseSampleDenominator uint64 = 100
+
 // Config holds the resolved gokubegate configuration. Prefer building it with
 // NewClient/NewGate and functional options instead of constructing it directly.
 type Config struct {
 	Namespace string
 	Service   string
+	Mode      Mode
 	Port      int32
 	PortName  string
 	Scheme    string
@@ -23,15 +39,18 @@ type Config struct {
 	// logical Host header; defaults to "cluster.local".
 	ClusterDomain string
 
-	Strategy        Strategy
+	Strategy         Strategy
 	CacheSyncTimeout time.Duration
 	DrainTimeout     time.Duration
 
-	MaxIdleConnsPerPod   int
-	IdleConnTimeout      time.Duration
-	DialTimeout          time.Duration
-	TCPKeepAlive         time.Duration
+	MaxIdleConnsPerPod    int
+	IdleConnTimeout       time.Duration
+	DialTimeout           time.Duration
+	TCPKeepAlive          time.Duration
 	ResponseHeaderTimeout time.Duration
+	// ConnectionCloseSampleDenominator applies only to ModeClusterIP. Zero
+	// disables sampled rotation; N closes approximately one in N requests.
+	ConnectionCloseSampleDenominator uint64
 
 	// RESTConfig overrides in-cluster config discovery.
 	RESTConfig *rest.Config
@@ -54,16 +73,30 @@ type Option func(*Config)
 
 func defaultConfig() *Config {
 	return &Config{
-		Scheme:                "http",
-		ClusterDomain:         "cluster.local",
-		CacheSyncTimeout:      20 * time.Second,
-		DrainTimeout:          30 * time.Second,
-		MaxIdleConnsPerPod:    16,
-		IdleConnTimeout:       90 * time.Second,
-		DialTimeout:           5 * time.Second,
-		TCPKeepAlive:          30 * time.Second,
-		ResponseHeaderTimeout: 15 * time.Second,
+		Scheme:                           "http",
+		Mode:                             ModePod,
+		ClusterDomain:                    "cluster.local",
+		CacheSyncTimeout:                 20 * time.Second,
+		DrainTimeout:                     30 * time.Second,
+		MaxIdleConnsPerPod:               32,
+		IdleConnTimeout:                  90 * time.Second,
+		DialTimeout:                      5 * time.Second,
+		TCPKeepAlive:                     30 * time.Second,
+		ResponseHeaderTimeout:            15 * time.Second,
+		ConnectionCloseSampleDenominator: 1000,
 	}
+}
+
+// WithMode selects pod-level or ClusterIP routing. Default: ModePod.
+func WithMode(mode Mode) Option {
+	return func(c *Config) { c.Mode = mode }
+}
+
+// WithConnectionCloseSampleDenominator configures sampled connection
+// rotation in ModeClusterIP. Zero disables it; non-zero values must be at
+// least 100. Default: 1000 (approximately 0.1% of ordinary HTTP requests).
+func WithConnectionCloseSampleDenominator(denominator uint64) Option {
+	return func(c *Config) { c.ConnectionCloseSampleDenominator = denominator }
 }
 
 // WithPort sets the target TCP port explicitly, skipping Service lookup.
@@ -91,8 +124,8 @@ func WithStrategy(s Strategy) Option {
 	return func(c *Config) { c.Strategy = s }
 }
 
-// WithCacheSyncTimeout sets how long to wait for the informer cache to sync
-// during startup. Default: 20s.
+// WithCacheSyncTimeout sets how long ModePod waits for informer cache sync
+// during startup. It is unused by ModeClusterIP. Default: 20s.
 func WithCacheSyncTimeout(d time.Duration) Option {
 	return func(c *Config) { c.CacheSyncTimeout = d }
 }
@@ -104,7 +137,7 @@ func WithDrainTimeout(d time.Duration) Option {
 }
 
 // WithMaxIdleConnsPerPod sets the idle keep-alive connection budget per Pod.
-// Default: 16.
+// In ModeClusterIP it controls the single shared Service-host pool. Default: 16.
 func WithMaxIdleConnsPerPod(n int) Option {
 	return func(c *Config) { c.MaxIdleConnsPerPod = n }
 }
@@ -174,6 +207,12 @@ func (c *Config) validate() error {
 	}
 	if c.Service == "" {
 		return fmt.Errorf("gokubegate: service is required")
+	}
+	if c.Mode != ModePod && c.Mode != ModeClusterIP {
+		return fmt.Errorf("gokubegate: unsupported mode %q", c.Mode)
+	}
+	if denominator := c.ConnectionCloseSampleDenominator; c.Mode == ModeClusterIP && denominator != 0 && denominator < minimumConnectionCloseSampleDenominator {
+		return fmt.Errorf("gokubegate: connection close sample denominator must be 0 or at least %d", minimumConnectionCloseSampleDenominator)
 	}
 	if c.Port < 0 || c.Port > 65535 {
 		return fmt.Errorf("gokubegate: invalid port %d", c.Port)
