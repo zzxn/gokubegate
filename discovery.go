@@ -31,9 +31,10 @@ type discovery struct {
 	factory   informers.SharedInformerFactory
 	informer  discoveryinformers.EndpointSliceInformer
 
-	trigger chan struct{}
-	stopCh  chan struct{}
-	wg      sync.WaitGroup
+	trigger  chan struct{}
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 
 	snapshot atomic.Pointer[EndpointSnapshot]
 	version  uint64
@@ -329,23 +330,21 @@ func (d *discovery) logicalHost() string {
 }
 
 func (d *discovery) stop() {
-	select {
-	case <-d.stopCh:
-	default:
+	d.stopOnce.Do(func() {
 		close(d.stopCh)
-	}
-	if d.factory != nil {
-		d.factory.Shutdown()
-	}
-	d.wg.Wait()
+		if d.factory != nil {
+			d.factory.Shutdown()
+		}
+		d.wg.Wait()
 
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	for k, b := range d.backends {
-		b.startDrain(d.cfg, func() { d.finishDrain(k) })
-	}
-	d.backends = map[EndpointKey]*PodBackend{}
-	d.snapshot.Store(&EndpointSnapshot{})
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		for k, b := range d.backends {
+			b.startDrain(d.cfg, func() { d.finishDrain(k) })
+		}
+		d.backends = map[EndpointKey]*PodBackend{}
+		d.snapshot.Store(&EndpointSnapshot{})
+	})
 }
 
 // endpointUsable reports whether an endpoint may receive new requests:
