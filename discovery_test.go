@@ -2,6 +2,7 @@ package gokubegate
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -186,5 +187,28 @@ func TestEmptyEndpointsAfterStop(t *testing.T) {
 	d.stop()
 	if !d.currentSnapshot().isEmpty() {
 		t.Fatal("snapshot should be empty after stop")
+	}
+}
+
+func TestConcurrentStopIsIdempotent(t *testing.T) {
+	d, _ := newTestDiscovery(t)
+
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d.stop()
+		}()
+	}
+	wg.Wait()
+
+	select {
+	case <-d.stopCh:
+	default:
+		t.Fatal("stop channel should be closed")
+	}
+	if !d.currentSnapshot().isEmpty() {
+		t.Fatal("snapshot should be empty after concurrent stop")
 	}
 }
