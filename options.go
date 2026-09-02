@@ -137,7 +137,7 @@ func WithDrainTimeout(d time.Duration) Option {
 }
 
 // WithMaxIdleConnsPerPod sets the idle keep-alive connection budget per Pod.
-// In ModeClusterIP it controls the single shared Service-host pool. Default: 16.
+// In ModeClusterIP it controls the single shared Service-host pool. Default: 32.
 func WithMaxIdleConnsPerPod(n int) Option {
 	return func(c *Config) { c.MaxIdleConnsPerPod = n }
 }

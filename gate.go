@@ -83,73 +83,73 @@ func (g *Gate) RoundTrip(req *http.Request) (*http.Response, error) {
 
 func (g *Gate) roundTripPod(req *http.Request) (*http.Response, error) {
 	start := time.Now()
-	backend, err := g.pickBackend()
+	backend, err := g.acquireBackend()
 	if err != nil {
 		return nil, err
 	}
 	emit(g.cfg, Event{Kind: EventEndpointPicked, Endpoint: backend.label})
 
-	// Capture connection reuse via httptrace. GotConn fires synchronously
-	// inside client.Do, before RoundTrip returns, so the value is safe to
-	// read afterwards (even for streaming bodies).
-	var reused bool
+	// ClientTrace hooks may run concurrently, so keep the captured connection
+	// reuse state safe to read after RoundTrip returns.
+	var reused atomic.Bool
 	traceCtx := httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
-		GotConn: func(info httptrace.GotConnInfo) { reused = info.Reused },
+		GotConn: func(info httptrace.GotConnInfo) { reused.Store(info.Reused) },
 	})
 
-	clone := req.Clone(traceCtx)
-	rewriteRequest(g.cfg, g.discovery.logicalHost(), clone, backend)
+	tracedReq := req.Clone(traceCtx)
+	rewriteRequest(g.cfg, g.discovery.logicalHost(), tracedReq, backend)
 
-	resp, err := backend.roundTrip(clone)
+	resp, err := backend.roundTripAcquired(tracedReq)
 	if err != nil {
 		emit(g.cfg, Event{Kind: EventRequestDone, Endpoint: backend.label, Result: "error", Duration: time.Since(start)})
 		return nil, err
 	}
-	emit(g.cfg, Event{Kind: EventRequestDone, Endpoint: backend.label, Result: "success", Reused: reused, Duration: time.Since(start)})
+	emit(g.cfg, Event{Kind: EventRequestDone, Endpoint: backend.label, Result: "success", Reused: reused.Load(), Duration: time.Since(start)})
 	return resp, nil
 }
 
 func (g *Gate) roundTripClusterIP(req *http.Request) (*http.Response, error) {
 	start := time.Now()
-	var reused bool
+	var reused atomic.Bool
 	traceCtx := httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
-		GotConn: func(info httptrace.GotConnInfo) { reused = info.Reused },
+		GotConn: func(info httptrace.GotConnInfo) { reused.Store(info.Reused) },
 	})
-	clone := req.Clone(traceCtx)
-	u := *clone.URL
-	clone.URL = &u
-	originalAuthority := clone.URL.Host
-	if clone.URL.Scheme == "" {
-		clone.URL.Scheme = g.cfg.Scheme
+	tracedReq := req.Clone(traceCtx)
+	u := *tracedReq.URL
+	tracedReq.URL = &u
+	originalAuthority := tracedReq.URL.Host
+	if tracedReq.URL.Scheme == "" {
+		tracedReq.URL.Scheme = g.cfg.Scheme
 	}
 	logicalHost := logicalServiceHost(g.cfg)
-	clone.URL.Host = logicalHost
-	if clone.Host == "" || clone.Host == originalAuthority {
-		clone.Host = logicalHost
+	tracedReq.URL.Host = logicalHost
+	if tracedReq.Host == "" || tracedReq.Host == originalAuthority {
+		tracedReq.Host = logicalHost
 	}
-	if !clone.Close && !isEventStreamRequest(clone) && g.shouldClose(g.cfg.ConnectionCloseSampleDenominator) {
-		clone.Close = true
+	if !tracedReq.Close && !isEventStreamRequest(tracedReq) && g.shouldClose(g.cfg.ConnectionCloseSampleDenominator) {
+		tracedReq.Close = true
 		emit(g.cfg, Event{Kind: EventConnectionRotated})
 	}
 
-	resp, err := g.clusterIPTransport.RoundTrip(clone)
+	resp, err := g.clusterIPTransport.RoundTrip(tracedReq)
 	if err != nil {
 		emit(g.cfg, Event{Kind: EventRequestDone, Result: "error", Duration: time.Since(start)})
 		return nil, err
 	}
-	emit(g.cfg, Event{Kind: EventRequestDone, Result: "success", Reused: reused, Duration: time.Since(start)})
+	emit(g.cfg, Event{Kind: EventRequestDone, Result: "success", Reused: reused.Load(), Duration: time.Since(start)})
 	return resp, nil
 }
 
-// pickBackend reads the current snapshot and selects a non-draining backend.
-// If the first pick races a removal, the snapshot is re-read once.
-func (g *Gate) pickBackend() (*PodBackend, error) {
+// acquireBackend reads the current snapshot and atomically accounts for the
+// request before the selected backend can begin draining. If the first pick
+// races a removal, the snapshot is re-read once.
+func (g *Gate) acquireBackend() (*PodBackend, error) {
 	snap := g.discovery.currentSnapshot()
 	if snap.isEmpty() {
 		return nil, ErrNoEndpoints
 	}
 	backend := g.strategy.Pick(snap.Backends)
-	if backend != nil && !backend.draining.Load() {
+	if backend != nil && backend.tryAcquire() {
 		return backend, nil
 	}
 	// Re-read once; a reconcile may have just removed the picked backend.
@@ -158,23 +158,23 @@ func (g *Gate) pickBackend() (*PodBackend, error) {
 		return nil, ErrNoEndpoints
 	}
 	backend = g.strategy.Pick(snap.Backends)
-	if backend == nil || backend.draining.Load() {
+	if backend == nil || !backend.tryAcquire() {
 		return nil, ErrNoEndpoints
 	}
 	return backend, nil
 }
 
-// rewriteRequest clones the request, points the URL at the pod address, and
-// preserves the logical service authority in the Host header.
-func rewriteRequest(cfg *Config, logicalHost string, clone *http.Request, backend *PodBackend) {
-	u := *clone.URL
-	clone.URL = &u
-	if clone.URL.Scheme == "" {
-		clone.URL.Scheme = cfg.Scheme
+// rewriteRequest points an already-cloned request at the pod address while
+// preserving the logical service authority in the Host header.
+func rewriteRequest(cfg *Config, logicalHost string, outReq *http.Request, backend *PodBackend) {
+	u := *outReq.URL
+	outReq.URL = &u
+	if outReq.URL.Scheme == "" {
+		outReq.URL.Scheme = cfg.Scheme
 	}
-	clone.URL.Host = backend.address
-	if clone.Host == "" {
-		clone.Host = logicalHost
+	outReq.URL.Host = backend.address
+	if outReq.Host == "" {
+		outReq.Host = logicalHost
 	}
 }
 

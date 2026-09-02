@@ -38,5 +38,5 @@ func (c *Client) Endpoints() []EndpointInfo { return c.gate.Endpoints() }
 // timeout and one with no timeout for SSE streams).
 func (c *Client) RoundTripper() http.RoundTripper { return c.gate }
 
-// Mode reports the routing mode. Always "pod" in v0.1.
+// Mode reports the configured routing mode: "pod" or "clusterip".
 func (c *Client) Mode() string { return string(c.gate.cfg.Mode) }

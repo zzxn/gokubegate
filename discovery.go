@@ -43,7 +43,7 @@ type discovery struct {
 	// and Close (via finishDrain).
 	mu       sync.Mutex
 	backends map[EndpointKey]*PodBackend
-	draining map[EndpointKey]*PodBackend
+	draining map[*PodBackend]struct{}
 }
 
 type endpointMeta struct {
@@ -81,7 +81,7 @@ func newDiscovery(ctx context.Context, cfg *Config) (*discovery, error) {
 		trigger:   make(chan struct{}, 1),
 		stopCh:    make(chan struct{}),
 		backends:  map[EndpointKey]*PodBackend{},
-		draining:  map[EndpointKey]*PodBackend{},
+		draining:  map[*PodBackend]struct{}{},
 	}
 
 	selector := labels.Set{discoveryv1.LabelServiceName: cfg.Service}.AsSelector().String()
@@ -112,11 +112,11 @@ func newDiscovery(ctx context.Context, cfg *Config) (*discovery, error) {
 		return nil, fmt.Errorf("gokubegate: endpointslice informer cache sync timed out for %s/%s", cfg.Namespace, cfg.Service)
 	}
 
-	d.wg.Add(1)
-	go d.run()
 	// Build the initial snapshot synchronously so that NewClient/NewGate
 	// return with a ready-to-use endpoint set.
 	d.reconcile()
+
+	d.wg.Go(d.run)
 
 	return d, nil
 }
@@ -162,7 +162,7 @@ func resolveServicePort(ctx context.Context, clientset kubernetes.Interface, cfg
 	if err != nil {
 		return 0, fmt.Errorf("gokubegate: resolve port for %s/%s: %w", cfg.Namespace, cfg.Service, err)
 	}
-	var fallback int32
+	var namedTargetPort string
 	for _, p := range svc.Spec.Ports {
 		if p.Protocol != "" && p.Protocol != corev1.ProtocolTCP {
 			continue
@@ -170,18 +170,18 @@ func resolveServicePort(ctx context.Context, clientset kubernetes.Interface, cfg
 		if cfg.PortName != "" && p.Name != cfg.PortName {
 			continue
 		}
-		if cfg.PortName == "" && fallback == 0 {
-			fallback = p.Port
-		}
 		if port, ok := numericTargetPort(p); ok {
 			return port, nil
 		}
+		if namedTargetPort == "" {
+			namedTargetPort = p.TargetPort.StrVal
+		}
+	}
+	if namedTargetPort != "" {
+		return 0, fmt.Errorf("gokubegate: service %s/%s uses named targetPort %q which cannot be resolved without pod metadata; set WithPort or use a numeric targetPort", cfg.Namespace, cfg.Service, namedTargetPort)
 	}
 	if cfg.PortName != "" {
 		return 0, fmt.Errorf("gokubegate: service %s/%s has no TCP port named %q", cfg.Namespace, cfg.Service, cfg.PortName)
-	}
-	if fallback != 0 {
-		return fallback, nil
 	}
 	return 0, fmt.Errorf("gokubegate: service %s/%s has no TCP ports", cfg.Namespace, cfg.Service)
 }
@@ -206,7 +206,6 @@ func (d *discovery) triggerReconcile() {
 }
 
 func (d *discovery) run() {
-	defer d.wg.Done()
 	for {
 		select {
 		case <-d.trigger:
@@ -218,11 +217,7 @@ func (d *discovery) run() {
 }
 
 func (d *discovery) reconcile() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	slices, err := d.informer.Lister().EndpointSlices(d.cfg.Namespace).List(
-		labels.SelectorFromSet(labels.Set{discoveryv1.LabelServiceName: d.cfg.Service}))
+	candidates, err := d.listCandidates()
 	if err != nil {
 		d.cfg.Logger.Warn("gokubegate: list endpoint slices failed",
 			"service", d.cfg.Service, "error", err)
@@ -230,7 +225,21 @@ func (d *discovery) reconcile() {
 		return
 	}
 
-	candidates := map[EndpointKey]endpointMeta{}
+	ready, draining := d.applyCandidates(candidates)
+	emit(d.cfg, Event{Kind: EventEndpointsUpdated, Ready: ready, Draining: draining})
+	emit(d.cfg, Event{Kind: EventReconcile, Result: "success"})
+	d.cfg.Logger.Debug("gokubegate: endpoints reconciled",
+		"service", d.cfg.Service, "ready", ready, "draining", draining)
+}
+
+func (d *discovery) listCandidates() (map[EndpointKey]endpointMeta, error) {
+	slices, err := d.informer.Lister().EndpointSlices(d.cfg.Namespace).List(
+		labels.SelectorFromSet(labels.Set{discoveryv1.LabelServiceName: d.cfg.Service}))
+	if err != nil {
+		return nil, err
+	}
+
+	candidates := make(map[EndpointKey]endpointMeta)
 	for _, s := range slices {
 		for _, ep := range s.Endpoints {
 			if !endpointUsable(ep) {
@@ -270,6 +279,12 @@ func (d *discovery) reconcile() {
 			}
 		}
 	}
+	return candidates, nil
+}
+
+func (d *discovery) applyCandidates(candidates map[EndpointKey]endpointMeta) (ready, draining int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 
 	keys := make([]EndpointKey, 0, len(candidates))
 	for k := range candidates {
@@ -291,29 +306,29 @@ func (d *discovery) reconcile() {
 		next = append(next, b)
 	}
 
+	removals := make([]*PodBackend, 0)
 	for k, b := range d.backends {
 		if _, ok := newBackends[k]; !ok {
-			d.draining[k] = b
-			d.cfg.Logger.Debug("gokubegate: endpoint removed, draining",
-				"service", d.cfg.Service, "address", b.address, "pod", b.podName)
-			b.startDrain(d.cfg, func() { d.finishDrain(k) })
+			removals = append(removals, b)
 		}
 	}
 	d.backends = newBackends
 
 	d.version++
-	snap := &EndpointSnapshot{Version: d.version, Backends: next, Updated: time.Now()}
-	d.snapshot.Store(snap)
+	d.snapshot.Store(&EndpointSnapshot{Version: d.version, Backends: next, Updated: time.Now()})
+	for _, removed := range removals {
+		d.draining[removed] = struct{}{}
+		d.cfg.Logger.Debug("gokubegate: endpoint removed, draining",
+			"service", d.cfg.Service, "address", removed.address, "pod", removed.podName)
+		removed.startDrain(d.cfg, func() { d.finishDrain(removed) })
+	}
 
-	emit(d.cfg, Event{Kind: EventEndpointsUpdated, Ready: len(next), Draining: len(d.draining)})
-	emit(d.cfg, Event{Kind: EventReconcile, Result: "success"})
-	d.cfg.Logger.Debug("gokubegate: endpoints reconciled",
-		"service", d.cfg.Service, "ready", len(next), "draining", len(d.draining))
+	return len(next), len(d.draining)
 }
 
-func (d *discovery) finishDrain(key EndpointKey) {
+func (d *discovery) finishDrain(backend *PodBackend) {
 	d.mu.Lock()
-	delete(d.draining, key)
+	delete(d.draining, backend)
 	d.mu.Unlock()
 }
 
@@ -339,8 +354,9 @@ func (d *discovery) stop() {
 
 		d.mu.Lock()
 		defer d.mu.Unlock()
-		for k, b := range d.backends {
-			b.startDrain(d.cfg, func() { d.finishDrain(k) })
+		for _, b := range d.backends {
+			d.draining[b] = struct{}{}
+			b.startDrain(d.cfg, func() { d.finishDrain(b) })
 		}
 		d.backends = map[EndpointKey]*PodBackend{}
 		d.snapshot.Store(&EndpointSnapshot{})
