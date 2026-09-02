@@ -2,6 +2,7 @@ package gokubegate
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes/fake"
 )
 
@@ -181,6 +183,25 @@ func TestScaleDownDrainsRemovedEndpoint(t *testing.T) {
 	}
 }
 
+func TestFinishDrainDoesNotDeleteNewBackendGeneration(t *testing.T) {
+	oldBackend := &PodBackend{}
+	newBackend := &PodBackend{}
+	d := &discovery{draining: map[*PodBackend]struct{}{oldBackend: {}, newBackend: {}}}
+
+	d.finishDrain(oldBackend)
+	if _, ok := d.draining[newBackend]; !ok {
+		t.Fatal("old backend completion deleted the new draining generation")
+	}
+	if got := len(d.draining); got != 1 {
+		t.Fatalf("draining generations=%d, want 1", got)
+	}
+
+	d.finishDrain(newBackend)
+	if _, ok := d.draining[newBackend]; ok {
+		t.Fatal("current backend completion did not clear its draining entry")
+	}
+}
+
 func TestEmptyEndpointsAfterStop(t *testing.T) {
 	d, _ := newTestDiscovery(t)
 	waitForSnapshot(t, d, func(s *EndpointSnapshot) bool { return len(s.Backends) == 0 })
@@ -210,5 +231,66 @@ func TestConcurrentStopIsIdempotent(t *testing.T) {
 	}
 	if !d.currentSnapshot().isEmpty() {
 		t.Fatal("snapshot should be empty after concurrent stop")
+	}
+}
+
+func TestResolveServicePortNumericAndUnnamed(t *testing.T) {
+	t.Parallel()
+	cs := fake.NewSimpleClientset(&corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: testService, Namespace: testNS},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{
+				{Name: "http", Protocol: corev1.ProtocolTCP, Port: 80, TargetPort: intstr.FromString("http")},
+				{Name: "grpc", Protocol: corev1.ProtocolTCP, Port: 81, TargetPort: intstr.FromInt32(9090)},
+			},
+		},
+	})
+	port, err := resolveServicePort(context.Background(), cs, &Config{Namespace: testNS, Service: testService})
+	if err != nil {
+		t.Fatalf("resolveServicePort: %v", err)
+	}
+	if port != 9090 {
+		t.Fatalf("port=%d, want numeric targetPort 9090", port)
+	}
+
+	// Unnamed TargetPort (neither Int nor String) defaults to the Service port.
+	csUnset := fake.NewSimpleClientset(&corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: testService, Namespace: testNS},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{
+				Protocol:   corev1.ProtocolTCP,
+				Port:       82,
+				TargetPort: intstr.IntOrString{Type: intstr.Type(2)},
+			}},
+		},
+	})
+	port, err = resolveServicePort(context.Background(), csUnset, &Config{Namespace: testNS, Service: testService})
+	if err != nil {
+		t.Fatalf("resolveServicePort unnamed: %v", err)
+	}
+	if port != 82 {
+		t.Fatalf("port=%d, want service port 82 for unset targetPort", port)
+	}
+}
+
+func TestResolveServicePortNamedTargetPortErrors(t *testing.T) {
+	t.Parallel()
+	cs := fake.NewSimpleClientset(&corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: testService, Namespace: testNS},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{
+				Name:       "http",
+				Protocol:   corev1.ProtocolTCP,
+				Port:       80,
+				TargetPort: intstr.FromString("http"),
+			}},
+		},
+	})
+	_, err := resolveServicePort(context.Background(), cs, &Config{Namespace: testNS, Service: testService})
+	if err == nil {
+		t.Fatal("expected named targetPort to error instead of falling back to service port")
+	}
+	if !strings.Contains(err.Error(), `named targetPort "http"`) {
+		t.Fatalf("error=%v, want named targetPort guidance", err)
 	}
 }

@@ -34,7 +34,9 @@ func TestDrainWaitsForInflight(t *testing.T) {
 		EndpointKey{Namespace: "ns", Service: "svc", Address: "10.0.0.1", Port: 80},
 		"10.0.0.1:80", "pod-1", "", "svc.ns.svc.cluster.local:80", cfg,
 	)
-	b.inflight.Add(1)
+	if !b.tryAcquire() {
+		t.Fatal("initial request should be admitted")
+	}
 
 	done := make(chan struct{})
 	b.startDrain(cfg, func() { close(done) })
@@ -45,7 +47,7 @@ func TestDrainWaitsForInflight(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	b.inflight.Add(-1)
+	b.release()
 
 	select {
 	case <-done:
@@ -54,6 +56,36 @@ func TestDrainWaitsForInflight(t *testing.T) {
 	}
 	if !b.draining.Load() {
 		t.Fatal("backend should be marked draining")
+	}
+}
+
+func TestDrainSynchronouslyRejectsNewAdmissions(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Service = "svc"
+	cfg.DrainTimeout = time.Second
+
+	b := newPodBackend(
+		EndpointKey{Namespace: "ns", Service: "svc", Address: "10.0.0.1", Port: 80},
+		"10.0.0.1:80", "pod-1", "", "svc.ns.svc.cluster.local:80", cfg,
+	)
+	if !b.tryAcquire() {
+		t.Fatal("initial request should be admitted")
+	}
+
+	done := make(chan struct{})
+	b.startDrain(cfg, func() { close(done) })
+	if b.tryAcquire() {
+		t.Fatal("request admitted after draining began")
+	}
+	if got := b.inflight.Load(); got != 1 {
+		t.Fatalf("inflight=%d, want 1", got)
+	}
+
+	b.release()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drain did not complete after admitted request released")
 	}
 }
 

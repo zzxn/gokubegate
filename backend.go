@@ -24,6 +24,7 @@ type PodBackend struct {
 	transport *http.Transport
 	inflight  atomic.Int64
 	draining  atomic.Bool
+	admission sync.Mutex
 	closed    chan struct{}
 	closeOnce sync.Once
 }
@@ -76,16 +77,35 @@ func newHTTPTransport(cfg *Config, logicalHost string, maxIdle int) *http.Transp
 	}
 }
 
-// roundTrip performs the downstream request, tracking in-flight count.
-// The returned body decrements the counter exactly once when closed.
-func (b *PodBackend) roundTrip(req *http.Request) (*http.Response, error) {
+// tryAcquire atomically admits a request and accounts for it before draining
+// can begin. Once draining is set, no new request can be admitted.
+func (b *PodBackend) tryAcquire() bool {
+	b.admission.Lock()
+	defer b.admission.Unlock()
+	if b.draining.Load() {
+		return false
+	}
 	b.inflight.Add(1)
+	return true
+}
+
+func (b *PodBackend) release() {
+	if b.inflight.Add(-1) == 0 && b.draining.Load() {
+		// A request may finish after the drain timeout. Close the connection if
+		// it became idle after the drain worker's final cleanup.
+		b.closeIdle()
+	}
+}
+
+// roundTripAcquired performs a request already accounted for by tryAcquire.
+// The returned body releases that admission exactly once when closed.
+func (b *PodBackend) roundTripAcquired(req *http.Request) (*http.Response, error) {
 	resp, err := b.transport.RoundTrip(req)
 	if err != nil {
-		b.inflight.Add(-1)
+		b.release()
 		return nil, err
 	}
-	resp.Body = &inflightBody{ReadCloser: resp.Body, onClose: func() { b.inflight.Add(-1) }}
+	resp.Body = &inflightBody{ReadCloser: resp.Body, onClose: b.release}
 	return resp, nil
 }
 
@@ -96,8 +116,12 @@ func (b *PodBackend) closeIdle() { b.transport.CloseIdleConnections() }
 // requests to finish (or DrainTimeout). In-flight requests are never
 // interrupted. onDone is called when the drain finishes.
 func (b *PodBackend) startDrain(cfg *Config, onDone func()) {
+	b.admission.Lock()
+	b.draining.Store(true)
+	b.admission.Unlock()
+
 	go func() {
-		b.draining.Store(true)
+		start := time.Now()
 		b.closeIdle()
 
 		deadline := time.Now().Add(cfg.DrainTimeout)
@@ -110,14 +134,21 @@ func (b *PodBackend) startDrain(cfg *Config, onDone func()) {
 		// Close again to drop connections that became idle during draining.
 		b.closeIdle()
 
-		timedOut := b.inflight.Load() > 0
+		inflight := b.inflight.Load()
+		timedOut := inflight > 0
 		b.closeOnce.Do(func() { close(b.closed) })
 
 		result := "completed"
 		if timedOut {
 			result = "timeout"
 		}
-		emit(cfg, Event{Kind: EventEndpointDrained, Endpoint: b.label, Result: result})
+		emit(cfg, Event{
+			Kind:     EventEndpointDrained,
+			Endpoint: b.label,
+			Inflight: inflight,
+			Result:   result,
+			Duration: time.Since(start),
+		})
 		if onDone != nil {
 			onDone()
 		}

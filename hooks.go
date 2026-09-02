@@ -34,6 +34,9 @@ type Event struct {
 	// Ready and Draining are set for EventEndpointsUpdated.
 	Ready    int
 	Draining int
+	// Inflight is set for EventEndpointDrained and reports how many requests
+	// were still active when draining completed or timed out.
+	Inflight int64
 	// Result values: EventRequestDone -> "success"|"error";
 	// EventReconcile -> "success"|"error"; EventEndpointDrained -> "completed"|"timeout".
 	Result string
@@ -41,7 +44,8 @@ type Event struct {
 	Reused bool
 	// Err is set for EventReconcile when Result == "error".
 	Err error
-	// Duration is set for EventRequestDone: full round-trip duration.
+	// Duration is set for EventRequestDone (full round-trip duration) and
+	// EventEndpointDrained (time spent waiting for drain completion).
 	Duration time.Duration
 }
 
